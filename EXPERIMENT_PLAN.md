@@ -1,199 +1,200 @@
-# Report: Minimal “fork-token + race” branching CoT experiment in GRPO-Zero (no KV-join)
+# Experiment Plan v0.2: Fork-Race GRPO for Wall-Clock Time-to-First-Correct
 
-## Motivation
+## 1) Goal (Primary Metric First)
 
-You want to test a very specific hypothesis that is *systems-realistic*:
+We optimize for **real wall-clock latency** to a correct answer, not total tokens.
 
-> **Parallel exploration can reduce wall-clock latency to a correct answer**, even if it increases total tokens, because GPUs exploit batching/throughput.
+Primary metric on held-out prompts:
+- `TTFC_ms` = milliseconds from first generated token to first verifier-correct answer.
 
-Most existing “multiple CoT” methods do branching *outside* the model (sample N complete solutions, then pick). That doesn’t answer your question: can the model learn **when** to branch as a *token-level decision*, and can it learn a policy that optimizes **time-to-first-correct** under a parallel decoding cost model?
+Primary report:
+- `TTFC_ms` p50 / p90
+- success@budget (fraction solved within fixed wall-clock budget)
+- cost-per-correct (USD per correct answer using instance hourly price)
 
-To isolate the effect, we avoid any “KV cache join/merge” across incompatible histories. Instead we implement a clean, well-defined concurrency primitive: **fork + race + early stop**. This keeps the transformer semantics intact and makes the experiment interpretable.
+Secondary metrics:
+- total generated tokens
+- fork rate
+- branch win rate
+
+## 2) Scope of v0 (kept minimal)
+
+- No KV-join/merge across histories.
+- At most one fork per rollout.
+- Exactly two branches after fork.
+- Fork valid only inside `<think> ... </think>`.
+- Race semantics: first **correct** branch wins; incorrect finished branch is terminated.
+
+## 3) Critical Risks and Fixes (From Prior Critique)
+
+### Risk A: Confounded comparisons (more compute looks better)
+Fix:
+- Include **compute-matched controls** and wall-clock budgets:
+1. `single-path`: normal decoding (no fork token used).
+2. `external-race-2`: two independent normal samples raced externally.
+3. `internal-fork-race-2`: proposed method.
+- Compare at equal wall-clock budget (e.g., 1500 ms, 2500 ms).
+
+### Risk B: Sparse reward => no fork behavior emerges
+Fix:
+- Two-phase curriculum:
+1. Warmup (`N_warmup` updates): `alpha=0`, force valid fork on fraction `p_force` of rollouts.
+2. Latency phase: remove forcing, set `alpha>0` and optimize latency.
+
+### Risk C: Unstable reward scale
+Fix:
+- Use bounded reward with normalized latency proxy:
+  - success: `R = 1 - alpha * L_norm - beta * invalid_fork`
+  - failure: `R = -delta - beta * invalid_fork`
+  - `L_norm in [0, 1]`
+
+### Risk D: Incorrect gradient attribution (double counting)
+Fix:
+- Token-weighted objective:
+  - pre-fork tokens: weight `1.0`
+  - post-fork branch tokens at step `s`: weight `1 / active_branches(s)`
+- Normalize by sum of token weights, not raw token count.
+
+### Risk E: Parser ambiguity for “inside think” and answer completion
+Fix:
+- Implement incremental text-state parser with explicit states:
+  - `before_think`, `in_think`, `after_think`
+  - answer-open / answer-close detection
+- Trigger verification only when `</answer>` is fully observed.
+
+### Risk F: KV memory blow-up after fork
+Fix:
+- Pre-allocate for worst-case `2 x batch_size` active rows in fork mode.
+- Log OOM and automatically fall back to smaller batch preset for fork runs.
+
+## 4) Wall-Clock-Aware Objective Design
+
+Direct per-rollout reward uses a **hardware-calibrated latency proxy** to reduce jitter while matching real timing:
+
+- Calibrate once per machine:
+  - `c1_ms` = average ms/step with 1 active branch
+  - `c2_ms` = average ms/step with 2 active branches
+- During rollout, accumulate:
+  - `T_proxy_ms = sum_s c_{b_s}` where `b_s in {1,2}` active branches at step `s`.
+- If correct answer appears at step `s*`, latency term uses prefix sum up to `s*`.
+- Normalize:
+  - `L_norm = min(T_proxy_ms / budget_ms, 1.0)`
+
+Reward:
+- success: `R = 1 - alpha * L_norm - beta * invalid_fork`
+- failure: `R = -delta - beta * invalid_fork`
+
+Default v0 constants:
+- `alpha = 0.5`
+- `beta = 0.2`
+- `delta = 0.2`
+
+Note: real wall-clock `TTFC_ms` is still the primary evaluation metric; proxy is for lower-variance training signal.
+
+## 5) Exact Behavioral Semantics
+
+Special tokens:
+- `<fork>` operator
+- `<fork1>` marker for branch A
+- `<fork2>` marker for branch B
+
+When `<fork>` is sampled in valid state:
+1. Replace sampled `<fork>` with `<fork1>` in branch A and `<fork2>` in branch B.
+2. Clone branch state (token buffer + KV row content up to current position).
+3. Continue both branches in parallel.
+
+Invalid fork handling:
+- If outside `in_think`, do not branch; keep token text but mark `invalid_fork=1` for penalty.
+
+Termination:
+- If any branch emits complete `</answer>` and verifier says correct -> stop rollout immediately and select winner.
+- If a branch emits complete incorrect answer -> terminate that branch only.
+- Stop rollout when all branches terminated or max length reached.
+
+## 6) Compute-Matched Experimental Protocol (Signal-Focused)
+
+Held-out evaluation set is fixed and shared across all methods.
+
+For each method (`single-path`, `external-race-2`, `internal-fork-race-2`):
+- Run with identical model checkpoint.
+- Measure across same prompts and same random-seed set.
+- Evaluate at fixed wall-clock budgets (e.g., 1.5s and 2.5s).
+
+Main questions:
+1. At equal wall-clock budget, does internal fork-race increase success@budget?
+2. At equal success target, does internal fork-race reduce p50/p90 `TTFC_ms`?
+
+## 7) Statistical Plan (Avoid False Signal)
+
+- Use at least 3 training seeds for v0.
+- For each metric, report mean and 95% bootstrap CI across prompts.
+- Predefine success criterion:
+  - internal-fork-race improves success@budget by >= 5 absolute points over single-path
+  - and is non-inferior to external-race-2 on success while improving p50 `TTFC_ms` by >= 10%.
+
+If criterion fails, treat v0 as negative/neutral signal and do not escalate complexity.
+
+## 8) Implementation Plan (Minimal, But Complete)
+
+1. Tokenizer/model plumbing:
+- add fork tokens
+- resize embeddings + output projection safely
+
+2. Fork-aware rollout engine:
+- branch state machine
+- parser state tracking
+- race + early stop + verifier hook
+
+3. Reward and logging:
+- compute `T_proxy_ms`, `TTFC_ms`, success, fork diagnostics
+- produce rollout-level scalar reward for GRPO
+
+4. GRPO update weighting:
+- token weights by active branch count
+- shared-prefix counted once
+
+5. Evaluation harness:
+- method selector (`single-path`, `external-race-2`, `internal-fork-race-2`)
+- budgeted wall-clock comparisons
+
+## 9) Test Plan (Required Before Remote Runs)
+
+Unit tests:
+- parser state transitions (`<think>`, `</think>`, `<answer>`, `</answer>`)
+- fork validity checks
+- early-stop winner selection
+- reward bound checks (`R` range and penalties)
+- token-weighted loss math (pre-fork vs post-fork weighting)
+
+Integration tests:
+- deterministic toy rollout with mocked logits to force:
+  - no fork path
+  - valid fork + branch A win
+  - valid fork + branch B win
+  - invalid fork penalty case
+- smoke GRPO update with tiny model shapes for no-NaN gradient.
+
+Sanity run before Vast:
+- short local run (few steps) to verify:
+  - non-zero fork rate during warmup
+  - stable loss/grad norm
+  - logs include `TTFC_ms`, `T_proxy_ms`, `fork_rate`.
+
+## 10) Vast.ai Execution Strategy (Bang-for-Buck for v0)
+
+Given prior measurements, default to **single RTX 4090** for best speed/$ in this workload family.
+
+Run plan:
+1. warmup stage checkpoint
+2. latency stage checkpoint
+3. fixed-budget evaluation across three methods
+
+Artifacts to keep:
+- checkpoints
+- tensorboard logs
+- evaluation CSV with per-prompt wall-clock metrics
+- run metadata (GPU, $/hr, commit SHA, seed)
 
 ---
 
-## Why not “KV-join” for the first experiment
-
-Merging KV caches from different histories does not correspond to any single token history in a standard transformer. It’s not just an approximation—it changes the underlying semantics in a way that is hard to make stationary and hard to interpret. You *might* be able to train a model to tolerate it, but then you’d be conflating:
-- learning to branch
-- with learning to cope with a nonstandard state operator
-
-Since you explicitly want to “separate effects,” we postpone KV-join to later iterations.
-
----
-
-## Core design: treat branching like a Unix process primitive
-
-Use a standard mental model:
-
-- **fork**: clone decoding state into two independent continuations
-- **race**: both continuations proceed in parallel (batch dimension)
-- **wait**: stop as soon as a success condition is met
-- **kill**: terminate losing branch(es)
-
-This gives you a clean, minimal primitive with explicit semantics that matches your throughput argument.
-
----
-
-## Behavioral spec (what “fork” means)
-
-### Tokens
-Introduce three special tokens:
-
-- `<fork>`: branching operator that the model may emit
-- `<fork1>`: marker token that replaces `<fork>` in branch A
-- `<fork2>`: marker token that replaces `<fork>` in branch B
-
-These markers help with debugging and allow explicit reward shaping later (e.g., “fork only inside think”).
-
-### When `<fork>` is emitted
-During decoding (ideally within `<think>...</think>`):
-
-1. Replace the just-generated `<fork>` with:
-   - branch A: `<fork1>`
-   - branch B: `<fork2>`
-2. Split the live decoding state into two branches **from the same prefix**.
-3. Continue decoding both branches in parallel (batched inference), independent sampling streams.
-
-### Constraints for v0
-To keep this minimal and interpretable:
-- Allow **at most one fork per rollout**.
-- Fork only allowed inside the `<think>` region; fork outside think is treated as invalid or heavily penalized.
-- Exactly **two branches** only (no recursive tree yet).
-
----
-
-## How the model produces a single final answer (no join required)
-
-### Race semantics: “first-correct wins”
-Both branches generate concurrently, and the episode ends as soon as the system obtains a **verifiably correct** answer:
-
-1. Each branch generates until it emits a complete answer block (e.g., closes `</answer>`), or hits max length.
-2. When a branch completes an answer, immediately verify it with the existing Countdown checker.
-3. If **correct**, terminate the entire rollout immediately; output that branch’s answer as the final answer.
-4. If incorrect, that branch can be marked “failed” (stop it), and the other branch continues racing.
-
-This creates a single final output (the winner’s answer) without mixing KV states.
-
-Why this matters: It aligns reward with your latency objective and prevents “finish fast even if wrong,” which would happen if you ended the episode at the first answer regardless of correctness.
-
----
-
-## Cost model and reward design
-
-Your key point is that wall-clock latency is closer to **critical path length** than total tokens. Race semantics naturally defines a latency proxy:
-
-- Let `T_first_correct` be the *token time index* (or step count) when the first correct answer becomes available.
-  - If both branches are decoded in lockstep time steps, this is basically “how many decoding steps until success,” not “how many tokens total were generated across branches.”
-- Reward should prioritize correctness first, then minimize `T_first_correct`.
-
-### Minimal reward (clean separation)
-Use a two-stage objective in one scalar reward:
-
-- If success: `R = 1.0 - α * T_first_correct`
-- If failure: `R = 0.0` (or a small negative penalty)
-
-Optional:
-- Add a small format reward only if needed to keep outputs parseable.
-- Add a small fork-usage penalty later (`-β` if fork used) once behavior emerges, to discourage gratuitous forks.
-
-### Why this separates effects
-- With `α = 0`, you test “does forking help correctness at all?”
-- With `α > 0`, you test “does forking reduce time-to-first-correct?”
-
----
-
-## Training integration with GRPO (minimal algorithmic disruption)
-
-GRPO expects:
-- M sampled rollouts per prompt
-- a scalar reward per rollout
-- advantage normalization within each prompt’s group
-- policy gradient update on the sampled tokens
-
-In this design:
-- Each rollout still produces **one scalar reward** and **one final answer**.
-- Forking only changes how the rollout is generated, not the GRPO math.
-
-### Gradient attribution (important practical detail)
-During a forked rollout, you generated tokens for *both* branches until termination. Those tokens influenced the probability of reaching the winning answer quickly.
-
-However, you don’t want gradients to explode just because you had two branches. To keep things stable and faithful to “parallel compute,” use one of these minimal normalization rules:
-
-**Recommended (simple):**
-- Compute standard per-token policy-gradient loss for all generated tokens across both branches up to termination.
-- Divide the total loss by the number of active branches averaged over time (or simply by 2 if you always fork into 2 and decode both until stop).
-
-This keeps gradient magnitudes comparable to non-fork rollouts and matches your “throughput makes parallel cheaper” spirit.
-
----
-
-## Implementation plan (smallest set of changes)
-
-### 1) Tokenizer and embeddings
-- Add `<fork> <fork1> <fork2>` as special tokens (single token IDs).
-- Expand embedding matrix by 3 and initialize new rows.
-- Expose token IDs to decoding code.
-
-### 2) Fork-aware decoding wrapper
-Introduce a new generation function (or modify existing generation) to support:
-
-- monitoring generated tokens for `<fork>`
-- splitting state into 2 branches at fork time
-- batched decoding of both branches
-- maintaining independent RNG per branch
-
-KV caches:
-- Duplicate or clone KV cache at the fork boundary (or recompute prefix once per branch if no KV abstraction exists yet—slower but correct).
-- Never merge KV states.
-
-### 3) Early stopping + verification hooks
-Implement “first-correct wins”:
-- detect when a branch closes an answer
-- run verifier
-- if correct: stop immediately and return winner
-- if incorrect: stop that branch; continue the other
-
-### 4) Reward computation
-Record:
-- `T_first_correct` (or max steps if failure)
-- success boolean
-- fork used boolean
-Compute reward scalar.
-
-### 5) GRPO loop remains the same
-Feed reward scalar into GRPO exactly as before.
-Only difference: rollout trajectories now may have two token streams internally, which you flatten into a single loss with normalization.
-
-### 6) Instrumentation (to validate the hypothesis)
-Log:
-- `fork_rate` (fraction of rollouts that fork)
-- success rate
-- `T_first_correct` distribution (p50/p90)
-- total tokens generated (for showing the divergence)
-- how often branch A wins vs branch B
-
-The key figure: success vs `T_first_correct` as training progresses.
-
----
-
-## Suggested ablation schedule
-
-1) Baseline GRPO-Zero (no fork tokens).
-2) Fork enabled, **α = 0** (correctness-only; does model learn to use fork at all?).
-3) Fork enabled, **α > 0** (latency pressure; does fork become selective and reduce `T_first_correct`?).
-4) (Optional) Add small fork penalty β to prevent gratuitous forks once it works.
-
----
-
-## End-of-report emphasis: the specific choices we made
-
-- **We rejected KV-cache “join/merge across histories” for v0** to avoid changing transformer semantics and conflating effects.
-- **We chose a Unix-like concurrency primitive**: fork → race → early stop (winner) → kill losers.
-- **We made fork tokenization explicit with three tokens**: `<fork>` operator plus `<fork1>/<fork2>` branch markers (fork rewrites into branch-id tokens).
-- **We constrained v0 heavily**: at most **one fork**, only within `<think>`, exactly **two branches**.
-- **We defined episode success as “first-correct wins,” not “first-answer wins”**, to prevent incentivizing fast wrong answers.
-- **We used a latency proxy based on critical path**: `T_first_correct` (time-to-first-correct), aligning with GPU batching intuition rather than total token count.
-- **We kept GRPO unchanged**: each rollout still yields **one scalar reward**; branching only modifies the rollout generator.
-- **We normalized gradients for forked rollouts** (e.g., divide by 2) so branching doesn’t artificially double update magnitude.
-- **We planned clean ablations**: α=0 to test correctness impact; α>0 to test latency optimization; optional β to discourage gratuitous forks.
+This v0 plan is intentionally strict: if internal fork-race cannot beat compute-matched controls on wall-clock metrics, we stop and reassess instead of adding complexity.
