@@ -1,0 +1,37 @@
+model:
+  pretrained_model_path: "Qwen2.5-3B-Instruct"
+  device: "cuda"
+  dtype: "bfloat16"
+data:
+  path: "Countdown-Tasks-3to4"
+  test_size: 128
+training:
+  random_seed: 1337
+  max_prompt_len: 256
+  max_gen_len: 1024
+  batch_size: 128
+  num_questions_per_batch: 16
+  micro_batch_size: 2
+  max_grad_norm: 1.0
+  learning_rate: 1.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  ckpt_dir: "ckpt_fork"
+  log_dir: "logs_fork"
+  skip_unfinished_episodes: false
+  ckpt_save_interval: 100
+  eval_interval: 10
+  memory_efficient_adamw: true
+fork_race:
+  enabled: true
+  # Reward parameters (EXPERIMENT_PLAN.md section 4)
+  alpha: 0.5        # latency penalty weight
+  beta: 0.2         # invalid fork penalty
+  delta: 0.2        # failure base penalty
+  budget_ms: 2500.0 # wall-clock budget for normalization
+  # Hardware calibration (update per machine)
+  c1_ms: 1.0        # ms/step with 1 branch
+  c2_ms: 1.5        # ms/step with 2 branches
+  # Warmup curriculum
+  n_warmup: 50      # warmup steps with forced forks
+  force_fork_prob: 0.3  # fraction of rollouts with forced fork during warmup

@@ -11,7 +11,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard.writer import SummaryWriter
 
 from countdown_task import CountdownTasksDataset, reward_function
-from grpo import rollout, update_policy
+from fork_reward import ForkRewardConfig
+from grpo import fork_rollout, rollout, update_policy, update_policy_fork
 from optimizer import MemoryEfficientAdamW
 from qwen2_model import Transformer
 from tokenizer import Tokenizer
@@ -73,6 +74,14 @@ def main(config_path: str):
     tb_writer = SummaryWriter(log_dir=f"{config['training']['log_dir']}/{current_time}")
     tokenizer = Tokenizer(str(pretrained_model_path / "tokenizer.json"))
 
+    # Fork-race configuration
+    fork_config = config.get("fork_race", {})
+    fork_enabled = fork_config.get("enabled", False)
+
+    if fork_enabled:
+        new_vocab_size = tokenizer.add_fork_tokens()
+        print(f"Fork-race enabled. Vocab size: {new_vocab_size}")
+
     train_dataset = CountdownTasksDataset(
         data_path=config["data"]["path"],
         tokenizer=tokenizer,
@@ -90,6 +99,10 @@ def main(config_path: str):
 
     model = Transformer.from_pretrained(pretrained_model_path, device=device).train()
 
+    if fork_enabled:
+        model.resize_embeddings(tokenizer.vocab_size)
+        print(f"Model embeddings resized to {model.vocab_size}")
+
     optimizer = MemoryEfficientAdamW(
         model.parameters(),
         lr=config["training"]["learning_rate"],
@@ -98,33 +111,77 @@ def main(config_path: str):
         enabled=config["training"]["memory_efficient_adamw"],
     )
 
+    # Fork reward config
+    fork_reward_config = None
+    if fork_enabled:
+        fork_reward_config = ForkRewardConfig(
+            alpha=fork_config.get("alpha", 0.5),
+            beta=fork_config.get("beta", 0.2),
+            delta=fork_config.get("delta", 0.2),
+            budget_ms=fork_config.get("budget_ms", 2500.0),
+            c1_ms=fork_config.get("c1_ms", 1.0),
+            c2_ms=fork_config.get("c2_ms", 1.5),
+        )
+        n_warmup = fork_config.get("n_warmup", 50)
+        force_fork_prob = fork_config.get("force_fork_prob", 0.3)
+
     start_time = time.time()
     ckpt_dir = Path(config["training"]["ckpt_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     for step, batch in enumerate(train_dataloader, start=1):
-        episodes = rollout(
-            model=model,
-            tokenizer=tokenizer,
-            batch=batch,
-            max_gen_len=config["training"]["max_gen_len"],
-            num_answer_per_question=NUM_ANSWERS_PER_QUESTION,
-            reward_function=reward_function,
-            device=device,
-            dtype=dtype,
-        )
+        if fork_enabled:
+            # Warmup: force forks with probability p_force
+            current_force_prob = force_fork_prob if step <= n_warmup else 0.0
+            episodes = fork_rollout(
+                model=model,
+                tokenizer=tokenizer,
+                batch=batch,
+                max_gen_len=config["training"]["max_gen_len"],
+                num_answer_per_question=NUM_ANSWERS_PER_QUESTION,
+                reward_function=reward_function,
+                device=device,
+                dtype=dtype,
+                fork_reward_config=fork_reward_config,
+                force_fork_prob=current_force_prob,
+            )
+        else:
+            episodes = rollout(
+                model=model,
+                tokenizer=tokenizer,
+                batch=batch,
+                max_gen_len=config["training"]["max_gen_len"],
+                num_answer_per_question=NUM_ANSWERS_PER_QUESTION,
+                reward_function=reward_function,
+                device=device,
+                dtype=dtype,
+            )
+
         if config["training"]["skip_unfinished_episodes"]:
             episodes = [episode for episode in episodes if episode.is_finished]
-        results = update_policy(
-            model=model,
-            optimizer=optimizer,
-            episodes=episodes,
-            micro_batch_size=config["training"]["micro_batch_size"],
-            pad_token_id=tokenizer.pad_token_id,
-            max_grad_norm=config["training"]["max_grad_norm"],
-            device=device,
-            dtype=dtype,
-        )
+
+        if fork_enabled:
+            results = update_policy_fork(
+                model=model,
+                optimizer=optimizer,
+                episodes=episodes,
+                micro_batch_size=config["training"]["micro_batch_size"],
+                pad_token_id=tokenizer.pad_token_id,
+                max_grad_norm=config["training"]["max_grad_norm"],
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            results = update_policy(
+                model=model,
+                optimizer=optimizer,
+                episodes=episodes,
+                micro_batch_size=config["training"]["micro_batch_size"],
+                pad_token_id=tokenizer.pad_token_id,
+                max_grad_norm=config["training"]["max_grad_norm"],
+                device=device,
+                dtype=dtype,
+            )
         torch.cuda.synchronize()
         end_time = time.time()
         duration = end_time - start_time
@@ -148,6 +205,18 @@ def main(config_path: str):
         mean_response_len = np.mean(
             [len(episode.generated_token_ids) for episode in episodes]
         )
+
+        # Fork-specific metrics
+        fork_rate = 0.0
+        mean_t_proxy = 0.0
+        if fork_enabled:
+            fork_rate = np.mean([
+                episode.reward_info.get("forked", 0.0) for episode in episodes
+            ])
+            mean_t_proxy = np.mean([
+                episode.reward_info.get("t_proxy_ms", 0.0) for episode in episodes
+            ])
+
         print(
             f"\rStep {step}, mean_reward: {mean_reward:.2f}, "
             f"train success_rate: {success_rate:.2f}, "
@@ -155,6 +224,7 @@ def main(config_path: str):
             f"num_finished_episodes: {num_finished_episodes}, "
             f"mean_response_len: {mean_response_len:.2f}, "
             f"entropy: {entropy:.2f}"
+            + (f", fork_rate: {fork_rate:.2f}, T_proxy: {mean_t_proxy:.1f}" if fork_enabled else "")
         )
         if step % config["training"]["eval_interval"] == 0:
             eval_success_rate = evaluate(model, tokenizer, device, dtype, config)
@@ -172,6 +242,11 @@ def main(config_path: str):
         tb_writer.add_scalar("learning_rate", lr, step)
         tb_writer.add_scalar("mean_response_len", mean_response_len, step)
         tb_writer.add_scalar("entropy", entropy, step)
+
+        if fork_enabled:
+            tb_writer.add_scalar("fork_rate", fork_rate, step)
+            tb_writer.add_scalar("T_proxy_ms", mean_t_proxy, step)
+
         for i, episode in enumerate(episodes):
             # TensorBoard treats text as markdown.
             text = html.escape(episode.text)
