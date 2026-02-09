@@ -18,4 +18,5 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytype>=2024.10.11",
+    "pytest>=8.0.0",
 ]
