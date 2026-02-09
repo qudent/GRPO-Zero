@@ -303,6 +303,44 @@ class Transformer(nn.Module):
         for layer in self.layers:
             layer.self_attn.del_kv_cache()
 
+    def resize_embeddings(self, new_vocab_size: int):
+        """Safely resize token embeddings and output projection.
+
+        New embeddings are initialized with small random values (mean of existing).
+        """
+        old_vocab_size = self.vocab_size
+        if new_vocab_size == old_vocab_size:
+            return
+        assert new_vocab_size > old_vocab_size, "Can only grow vocabulary"
+
+        old_embed = self.embed_tokens
+        device = old_embed.weight.device
+        dtype = old_embed.weight.dtype
+        hidden_size = old_embed.weight.shape[1]
+
+        new_embed = nn.Embedding(new_vocab_size, hidden_size, device=device, dtype=dtype)
+        with torch.no_grad():
+            new_embed.weight[:old_vocab_size] = old_embed.weight
+            # Initialize new tokens with mean of existing embeddings + small noise
+            mean_embed = old_embed.weight.mean(dim=0)
+            for i in range(old_vocab_size, new_vocab_size):
+                noise = torch.randn(hidden_size, device=device, dtype=dtype) * 0.01
+                new_embed.weight[i] = mean_embed + noise
+
+        self.embed_tokens = new_embed
+        self.vocab_size = new_vocab_size
+        self.params.vocab_size = new_vocab_size
+
+        # If there's a separate lm_head, resize it too
+        if not self.params.tie_word_embeddings and hasattr(self, "lm_head"):
+            old_lm = self.lm_head
+            new_lm = nn.Linear(hidden_size, new_vocab_size, bias=False, device=device, dtype=dtype)
+            with torch.no_grad():
+                new_lm.weight[:old_vocab_size] = old_lm.weight
+                for i in range(old_vocab_size, new_vocab_size):
+                    new_lm.weight[i] = torch.zeros(hidden_size, device=device, dtype=dtype)
+            self.lm_head = new_lm
+
     @classmethod
     def from_pretrained(cls, ckpt_path, device: torch.device):
         config_file = Path(ckpt_path) / "config.json"

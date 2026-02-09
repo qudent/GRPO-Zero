@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Dict, List
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -14,6 +14,10 @@ class Episode:
     is_finished: bool
     reward: float
     reward_info: Dict[str, float]
+    # Fork-race fields (optional, backward compatible)
+    token_weights: Optional[List[float]] = None
+    fork_info: Optional[Dict[str, float]] = None
+    branch_id: Optional[int] = None  # None=no fork, 0=branch A, 1=branch B
 
 
 @dataclass
