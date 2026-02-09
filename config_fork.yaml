@@ -33,5 +33,5 @@ fork_race:
   c1_ms: 1.0        # ms/step with 1 branch
   c2_ms: 1.5        # ms/step with 2 branches
   # Warmup curriculum
-  n_warmup: 50      # warmup steps with forced forks
-  force_fork_prob: 0.3  # fraction of rollouts with forced fork during warmup
+  n_warmup: 50              # warmup steps with fork-token probability targeting
+  warmup_fork_target_prob: 0.25  # target P(<fork>) for valid rows during warmup

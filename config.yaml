@@ -9,6 +9,8 @@ training:
   random_seed: 1337
   max_prompt_len: 256
   max_gen_len: 1024
+  # Optional explicit training cap. null => full dataloader pass.
+  max_steps: null
   batch_size: 256
   num_questions_per_batch: 32
   # Number of examples per gradient accumulation step
@@ -23,3 +25,8 @@ training:
   ckpt_save_interval: 100
   eval_interval: 10
   memory_efficient_adamw: false
+evaluation:
+  # If enabled, eval uses fork_rollout with no warmup fork targeting.
+  use_fork_rollout: false
+  # Optional cap for eval speed; null => full test split.
+  max_eval_batches: null

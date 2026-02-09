@@ -1,4 +1,5 @@
 import html
+import random
 import time
 from argparse import ArgumentParser
 from datetime import datetime
@@ -18,45 +19,119 @@ from qwen2_model import Transformer
 from tokenizer import Tokenizer
 
 
-def evaluate(model, tokenizer, device, dtype, config):
+def evaluate(
+    model,
+    tokenizer,
+    device,
+    dtype,
+    config,
+    fork_enabled: bool = False,
+    fork_reward_config: ForkRewardConfig | None = None,
+):
+    """Run held-out evaluation and return scalar metrics."""
     test_dataset = CountdownTasksDataset(
         data_path=config["data"]["path"],
         tokenizer=tokenizer,
         split="test",
         test_size=config["data"]["test_size"],
     )
+    eval_cfg = config.get("evaluation", {})
+    use_fork_rollout = eval_cfg.get("use_fork_rollout", fork_enabled)
+    max_eval_batches = eval_cfg.get("max_eval_batches", None)
+
     generator = torch.Generator(device=device)
     # We reduce the batch size by half as we want to
     # generate twice as long trajectories.
+    eval_batch_size = max(1, config["training"]["batch_size"] // 2)
     dataloader = DataLoader(
         test_dataset,
         shuffle=False,
         collate_fn=CountdownTasksDataset.collate_fn,
         generator=generator,
-        batch_size=config["training"]["batch_size"] // 2,
+        batch_size=eval_batch_size,
         drop_last=False,
     )
+
     success = []
-    for batch in dataloader:
-        episodes = rollout(
-            model=model,
-            tokenizer=tokenizer,
-            batch=batch,
-            max_gen_len=config["training"]["max_gen_len"] * 2,
-            num_answer_per_question=1,
-            reward_function=reward_function,
-            device=device,
-            dtype=dtype,
-        )
-        success.extend([episode.reward_info["answer_reward"] for episode in episodes])
-    return np.mean(success)
+    ttfc_ms = []
+    fork_rate = []
+    t_proxy_ms = []
+    for batch_idx, batch in enumerate(dataloader, start=1):
+        t0 = time.perf_counter()
+        if use_fork_rollout:
+            episodes = fork_rollout(
+                model=model,
+                tokenizer=tokenizer,
+                batch=batch,
+                max_gen_len=config["training"]["max_gen_len"] * 2,
+                num_answer_per_question=1,
+                reward_function=reward_function,
+                device=device,
+                dtype=dtype,
+                fork_reward_config=fork_reward_config,
+                fork_token_logit_bias=0.0,
+                fork_token_target_prob=None,
+            )
+        else:
+            episodes = rollout(
+                model=model,
+                tokenizer=tokenizer,
+                batch=batch,
+                max_gen_len=config["training"]["max_gen_len"] * 2,
+                num_answer_per_question=1,
+                reward_function=reward_function,
+                device=device,
+                dtype=dtype,
+            )
+        batch_ms = (time.perf_counter() - t0) * 1000.0
+
+        if episodes:
+            # This is a rollout-level timing proxy for evaluation throughput.
+            per_episode_ms = batch_ms / len(episodes)
+            ttfc_ms.extend([per_episode_ms] * len(episodes))
+            success.extend([episode.reward_info["answer_reward"] for episode in episodes])
+
+        if use_fork_rollout:
+            fork_rate.extend([episode.reward_info.get("forked", 0.0) for episode in episodes])
+            t_proxy_ms.extend([episode.reward_info.get("t_proxy_ms", 0.0) for episode in episodes])
+
+        if max_eval_batches is not None and batch_idx >= max_eval_batches:
+            break
+
+    metrics = {
+        "success_rate": float(np.mean(success)) if success else 0.0,
+        "ttfc_ms_p50": float(np.percentile(ttfc_ms, 50)) if ttfc_ms else 0.0,
+        "ttfc_ms_p90": float(np.percentile(ttfc_ms, 90)) if ttfc_ms else 0.0,
+        "num_eval_episodes": len(success),
+    }
+    if use_fork_rollout:
+        metrics["fork_rate"] = float(np.mean(fork_rate)) if fork_rate else 0.0
+        metrics["t_proxy_ms"] = float(np.mean(t_proxy_ms)) if t_proxy_ms else 0.0
+    return metrics
 
 
-def main(config_path: str):
+def main(config_path: str, max_steps_override: int | None = None):
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
     pretrained_model_path = Path(config["model"]["pretrained_model_path"])
+    data_path = Path(config["data"]["path"])
+    if not pretrained_model_path.exists():
+        raise FileNotFoundError(
+            f"Pretrained model path not found: {pretrained_model_path}. "
+            "Clone/download the model first."
+        )
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"Dataset path not found: {data_path}. "
+            "Clone/download the dataset first."
+        )
+    if not (data_path / "data").exists():
+        raise FileNotFoundError(
+            f"Dataset parquet missing: {(data_path / 'data')}. "
+            "Expected Countdown parquet at <data_path>/data."
+        )
+
     device = torch.device(config["model"]["device"])
     dtype_map = {
         "bfloat16": torch.bfloat16,
@@ -66,9 +141,18 @@ def main(config_path: str):
     dtype = dtype_map.get(config["model"]["dtype"], torch.bfloat16)
     torch.set_default_device(device)
     torch.random.manual_seed(config["training"]["random_seed"])
+    random.seed(config["training"]["random_seed"])
+
     BATCH_SIZE = config["training"]["batch_size"]
     NUM_QUESTIONS_PER_BATCH = config["training"]["num_questions_per_batch"]
     NUM_ANSWERS_PER_QUESTION = BATCH_SIZE // NUM_QUESTIONS_PER_BATCH
+    if BATCH_SIZE % NUM_QUESTIONS_PER_BATCH != 0:
+        raise ValueError("training.batch_size must be divisible by training.num_questions_per_batch")
+    max_steps = max_steps_override
+    if max_steps is None:
+        max_steps = config["training"].get("max_steps", None)
+    if max_steps is not None and max_steps <= 0:
+        raise ValueError("max_steps must be > 0 if provided")
 
     current_time = datetime.now().strftime(r"%Y%m%d-%H%M%S")
     tb_writer = SummaryWriter(log_dir=f"{config['training']['log_dir']}/{current_time}")
@@ -100,16 +184,31 @@ def main(config_path: str):
     model = Transformer.from_pretrained(pretrained_model_path, device=device).train()
 
     if fork_enabled:
-        model.resize_embeddings(tokenizer.vocab_size)
-        print(f"Model embeddings resized to {model.vocab_size}")
+        if tokenizer.vocab_size > model.vocab_size:
+            model.resize_embeddings(tokenizer.vocab_size)
+            print(f"Model embeddings resized to {model.vocab_size}")
+        else:
+            print(
+                f"Skipping resize: tokenizer vocab ({tokenizer.vocab_size}) "
+                f"<= model vocab ({model.vocab_size})"
+            )
 
-    optimizer = MemoryEfficientAdamW(
-        model.parameters(),
-        lr=config["training"]["learning_rate"],
-        weight_decay=config["training"]["weight_decay"],
-        betas=config["training"]["betas"],
-        enabled=config["training"]["memory_efficient_adamw"],
-    )
+    optimizer_name = str(config["training"].get("optimizer", "adamw")).lower()
+    if optimizer_name == "sgd":
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=config["training"]["learning_rate"],
+            momentum=float(config["training"].get("sgd_momentum", 0.0)),
+            weight_decay=config["training"]["weight_decay"],
+        )
+    else:
+        optimizer = MemoryEfficientAdamW(
+            model.parameters(),
+            lr=config["training"]["learning_rate"],
+            weight_decay=config["training"]["weight_decay"],
+            betas=config["training"]["betas"],
+            enabled=config["training"]["memory_efficient_adamw"],
+        )
 
     # Fork reward config
     fork_reward_config = None
@@ -123,16 +222,23 @@ def main(config_path: str):
             c2_ms=fork_config.get("c2_ms", 1.5),
         )
         n_warmup = fork_config.get("n_warmup", 50)
-        force_fork_prob = fork_config.get("force_fork_prob", 0.3)
+        warmup_fork_target_prob = float(fork_config.get("warmup_fork_target_prob", 0.25))
 
     start_time = time.time()
     ckpt_dir = Path(config["training"]["ckpt_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        f"Training started. fork_enabled={fork_enabled}, "
+        f"max_steps={max_steps if max_steps is not None else 'full_dataloader'}"
+    )
 
     for step, batch in enumerate(train_dataloader, start=1):
+        if max_steps is not None and step > max_steps:
+            break
+
         if fork_enabled:
-            # Warmup: force forks with probability p_force
-            current_force_prob = force_fork_prob if step <= n_warmup else 0.0
+            # Warmup: set <fork> token probability target on valid fork states.
+            current_fork_target_prob = warmup_fork_target_prob if step <= n_warmup else None
             episodes = fork_rollout(
                 model=model,
                 tokenizer=tokenizer,
@@ -143,7 +249,8 @@ def main(config_path: str):
                 device=device,
                 dtype=dtype,
                 fork_reward_config=fork_reward_config,
-                force_fork_prob=current_force_prob,
+                fork_token_logit_bias=0.0,
+                fork_token_target_prob=current_fork_target_prob,
             )
         else:
             episodes = rollout(
@@ -159,6 +266,9 @@ def main(config_path: str):
 
         if config["training"]["skip_unfinished_episodes"]:
             episodes = [episode for episode in episodes if episode.is_finished]
+        if not episodes:
+            print(f"\rStep {step}: no episodes after filtering, skipping update.")
+            continue
 
         if fork_enabled:
             results = update_policy_fork(
@@ -182,7 +292,8 @@ def main(config_path: str):
                 device=device,
                 dtype=dtype,
             )
-        torch.cuda.synchronize()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         end_time = time.time()
         duration = end_time - start_time
         start_time = end_time
@@ -227,9 +338,32 @@ def main(config_path: str):
             + (f", fork_rate: {fork_rate:.2f}, T_proxy: {mean_t_proxy:.1f}" if fork_enabled else "")
         )
         if step % config["training"]["eval_interval"] == 0:
-            eval_success_rate = evaluate(model, tokenizer, device, dtype, config)
-            print(f"\rEval success rate: {eval_success_rate:.2f}" + " " * 100)
-            tb_writer.add_scalar("success_rate/eval", eval_success_rate, step)
+            eval_metrics = evaluate(
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                dtype=dtype,
+                config=config,
+                fork_enabled=fork_enabled,
+                fork_reward_config=fork_reward_config,
+            )
+            print(
+                f"\rEval success_rate: {eval_metrics['success_rate']:.2f}, "
+                f"TTFC p50/p90: {eval_metrics['ttfc_ms_p50']:.1f}/{eval_metrics['ttfc_ms_p90']:.1f} ms"
+                + (
+                    f", eval_fork_rate: {eval_metrics.get('fork_rate', 0.0):.2f}, "
+                    f"eval_T_proxy: {eval_metrics.get('t_proxy_ms', 0.0):.1f}"
+                    if fork_enabled
+                    else ""
+                )
+                + " " * 20
+            )
+            tb_writer.add_scalar("success_rate/eval", eval_metrics["success_rate"], step)
+            tb_writer.add_scalar("ttfc_ms_p50/eval", eval_metrics["ttfc_ms_p50"], step)
+            tb_writer.add_scalar("ttfc_ms_p90/eval", eval_metrics["ttfc_ms_p90"], step)
+            if fork_enabled:
+                tb_writer.add_scalar("fork_rate/eval", eval_metrics.get("fork_rate", 0.0), step)
+                tb_writer.add_scalar("T_proxy_ms/eval", eval_metrics.get("t_proxy_ms", 0.0), step)
 
         tb_writer.add_scalar("loss", loss, step)
         tb_writer.add_scalar("mean_reward", mean_reward, step)
@@ -258,9 +392,13 @@ def main(config_path: str):
             torch.save(model.state_dict(), output_file)
             print(f"Saved checkpoint to {output_file}")
 
+    tb_writer.flush()
+    tb_writer.close()
+
 
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--max_steps", type=int, default=None)
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, max_steps_override=args.max_steps)

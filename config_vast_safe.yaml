@@ -1,0 +1,40 @@
+model:
+  pretrained_model_path: "Qwen2.5-3B-Instruct"
+  device: "cuda"
+  dtype: "bfloat16"
+data:
+  path: "Countdown-Tasks-3to4"
+  test_size: 128
+training:
+  random_seed: 1337
+  max_prompt_len: 256
+  max_gen_len: 64
+  max_steps: 1
+  batch_size: 4
+  num_questions_per_batch: 2
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  learning_rate: 1.0e-5
+  optimizer: "sgd"
+  sgd_momentum: 0.0
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  ckpt_dir: "ckpt_fork_safe"
+  log_dir: "logs_fork_safe"
+  skip_unfinished_episodes: false
+  ckpt_save_interval: 50
+  eval_interval: 100
+  memory_efficient_adamw: true
+evaluation:
+  use_fork_rollout: true
+  max_eval_batches: 1
+fork_race:
+  enabled: true
+  alpha: 0.5
+  beta: 0.2
+  delta: 0.2
+  budget_ms: 2500.0
+  c1_ms: 1.0
+  c2_ms: 1.5
+  n_warmup: 1
+  warmup_fork_target_prob: 0.25

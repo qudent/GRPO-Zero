@@ -239,25 +239,28 @@ class TestSmokeEndToEnd:
             device=torch.device("cpu"),
             dtype=torch.float32,
             fork_reward_config=config,
-            force_fork_prob=0.0,
+            fork_token_logit_bias=0.0,
+            fork_token_target_prob=None,
         )
 
         assert len(episodes) >= 2
         for ep in episodes:
             assert not np.isnan(ep.reward)
 
-    def test_fork_rollout_with_forced_fork(self):
-        """Fork rollout with force_fork_prob=1.0 to ensure forking happens."""
+    def test_fork_rollout_with_warmup_bias(self):
+        """Fork rollout with strong warmup logit bias should trigger forking."""
         from grpo import fork_rollout
         from countdown_task import reward_function
 
         model = TinyTransformer(vocab_size=203, hidden=32, n_heads=2)
         tokenizer = MockTokenizer(vocab_size=200)
         model.resize_embeddings(tokenizer.vocab_size)
+        # Avoid early random EOS finishes before forced-fork trigger.
+        tokenizer.eos_token_id = None
 
         batch = MiniBatch(
-            prefix=["prefix1"],
-            prefix_tokens=[["p", "r"]],
+            prefix=["prefix1<think>"],
+            prefix_tokens=[["p", "r", "<think>"]],
             prefix_token_ids=[[10, 20]],
             numbers=[[1, 2, 3]],
             target=[6],
@@ -274,11 +277,24 @@ class TestSmokeEndToEnd:
             device=torch.device("cpu"),
             dtype=torch.float32,
             fork_reward_config=config,
-            force_fork_prob=1.0,
+            fork_token_logit_bias=0.0,
+            fork_token_target_prob=0.90,
         )
 
-        # With forced fork, should have more episodes (branches)
+        # With strong fork bias, should create branch episodes.
         assert len(episodes) >= 2
+        assert any(ep.reward_info.get("forked", 0.0) > 0.5 for ep in episodes)
+        assert any(ep.branch_id == 1 for ep in episodes)
+        assert any(
+            tokenizer.fork1_token_id in ep.generated_token_ids
+            for ep in episodes
+            if ep.branch_id == 0
+        )
+        assert any(
+            tokenizer.fork2_token_id in ep.generated_token_ids
+            for ep in episodes
+            if ep.branch_id == 1
+        )
         for ep in episodes:
             assert not np.isnan(ep.reward)
             assert ep.token_weights is not None
@@ -312,7 +328,8 @@ class TestSmokeEndToEnd:
             device=torch.device("cpu"),
             dtype=torch.float32,
             fork_reward_config=config,
-            force_fork_prob=0.0,
+            fork_token_logit_bias=0.0,
+            fork_token_target_prob=None,
         )
 
         result = update_policy_fork(

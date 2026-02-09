@@ -1,0 +1,40 @@
+model:
+  pretrained_model_path: "Qwen2.5-3B-Instruct"
+  device: "cuda"
+  dtype: "bfloat16"
+data:
+  path: "Countdown-Tasks-3to4"
+  test_size: 128
+training:
+  random_seed: 1337
+  max_prompt_len: 256
+  max_gen_len: 256
+  # Hard cap to avoid unbounded cost.
+  max_steps: 20
+  batch_size: 32
+  num_questions_per_batch: 8
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  learning_rate: 1.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  ckpt_dir: "ckpt_fork_bounded"
+  log_dir: "logs_fork_bounded"
+  skip_unfinished_episodes: true
+  ckpt_save_interval: 10
+  eval_interval: 5
+  memory_efficient_adamw: true
+evaluation:
+  use_fork_rollout: true
+  # Keep eval short during pilot runs.
+  max_eval_batches: 2
+fork_race:
+  enabled: true
+  alpha: 0.5
+  beta: 0.2
+  delta: 0.2
+  budget_ms: 2500.0
+  c1_ms: 1.0
+  c2_ms: 1.5
+  n_warmup: 10
+  warmup_fork_target_prob: 0.25

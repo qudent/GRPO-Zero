@@ -12,7 +12,6 @@ from fork_parser import ForkParser
 from fork_reward import (
     ForkRewardConfig,
     compute_fork_reward,
-    compute_latency_proxy,
     compute_token_weights,
 )
 from qwen2_model import Transformer
@@ -132,7 +131,8 @@ def fork_rollout(
     device: torch.device,
     dtype: torch.dtype,
     fork_reward_config: Optional[ForkRewardConfig] = None,
-    force_fork_prob: float = 0.0,
+    fork_token_logit_bias: float = 0.0,
+    fork_token_target_prob: Optional[float] = None,
 ) -> List[Episode]:
     """Fork-aware rollout with branch racing and early stop.
 
@@ -148,6 +148,7 @@ def fork_rollout(
     fork_token_id = tokenizer.fork_token_id
     fork1_token_id = tokenizer.fork1_token_id
     fork2_token_id = tokenizer.fork2_token_id
+    fork_event_token_ids = {fork_token_id, fork1_token_id, fork2_token_id}
 
     prefix_token_ids = batch.prefix_token_ids
     bsz = len(batch.prefix) * num_answer_per_question
@@ -182,24 +183,36 @@ def fork_rollout(
     is_finished = torch.zeros((max_rows,), dtype=torch.bool, device=device)
     has_forked = torch.zeros((bsz,), dtype=torch.bool, device=device)
 
-    # Per-row parser state (only for active rows, tracked on CPU)
-    parsers = [ForkParser() for _ in range(max_rows)]
     # Track which question each row belongs to
     question_idx = [i // num_answer_per_question for i in range(bsz)] + \
                    [i // num_answer_per_question for i in range(bsz)]
-    # Track answer indices within questions
-    answer_idx = [i % num_answer_per_question for i in range(bsz)] + \
-                 [i % num_answer_per_question for i in range(bsz)]
+
+    def _init_parser_for_prompt(prompt_text: str) -> ForkParser:
+        """Initialize parser state from prompt suffix only.
+
+        Prompt text may include example tags in instructions. We only care
+        whether the model starts generation inside an unclosed <think> block.
+        """
+        parser = ForkParser()
+        think_open = prompt_text.rfind("<think>")
+        think_close = prompt_text.rfind("</think>")
+        if think_open != -1 and think_open > think_close:
+            parser.feed("<think>")
+        return parser
+
+    # Per-row parser state (tracked on CPU). Branch A rows are initialized
+    # from prompt state so valid-fork detection is prompt-aware.
+    parsers = [ForkParser() for _ in range(max_rows)]
+    for row in range(bsz):
+        parsers[row] = _init_parser_for_prompt(batch.prefix[question_idx[row]])
 
     # Per-row fork metadata
     fork_step = [None] * max_rows  # step at which fork occurred
     invalid_fork_flags = [False] * max_rows
-    # Track which rows have correct answers (for race termination)
-    question_solved = [False] * len(batch.prefix)
-
-    # Force fork RNG
-    import random
-    force_fork_flags = [random.random() < force_fork_prob for _ in range(bsz)]
+    # Per-base-row race status (branch A row i and optional branch B row bsz+i)
+    race_solved = [False] * bsz
+    # Latency proxy accumulated online until first-correct answer.
+    t_proxy_ms = [0.0] * bsz
 
     for cur_pos in range(min_prompt_len, total_len):
         active_count = is_active.sum().item()
@@ -217,8 +230,47 @@ def fork_rollout(
         if not active_mask.any():
             break
 
+        # Accumulate wall-clock latency proxy per base row up to first-correct.
+        for base_row in range(bsz):
+            if race_solved[base_row]:
+                continue
+            active_branches = int(active_mask[base_row].item())
+            active_branches += int(active_mask[base_row + bsz].item())
+            if active_branches == 1:
+                t_proxy_ms[base_row] += fork_reward_config.c1_ms
+            elif active_branches >= 2:
+                t_proxy_ms[base_row] += fork_reward_config.c2_ms
+
         with torch.autocast(device_type=device.type, dtype=dtype):
             logits = model.inference(tokens[:max_rows, prev_pos:cur_pos], prev_pos)
+
+        # Optional warmup signal: increase <fork> probability where a fork is valid.
+        # If target probability is provided, map logits to that exact target.
+        if fork_token_target_prob is not None:
+            eps = 1e-6
+            target_p = float(min(max(fork_token_target_prob, eps), 1.0 - eps))
+            target_logit = math.log(target_p / (1.0 - target_p))
+            for row in range(bsz):
+                if not is_active[row].item() or is_finished[row].item():
+                    continue
+                if has_forked[row].item():
+                    continue
+                if not parsers[row].check_fork_valid():
+                    continue
+                row_logits = logits[row, -1]
+                row_probs = torch.softmax(row_logits, dim=-1)
+                current_p = float(row_probs[fork_token_id].item())
+                current_p = min(max(current_p, eps), 1.0 - eps)
+                current_logit = math.log(current_p / (1.0 - current_p))
+                logits[row, -1, fork_token_id] += target_logit - current_logit
+        elif fork_token_logit_bias != 0.0:
+            for row in range(bsz):
+                if not is_active[row].item() or is_finished[row].item():
+                    continue
+                if has_forked[row].item():
+                    continue
+                if parsers[row].check_fork_valid():
+                    logits[row, -1, fork_token_id] += fork_token_logit_bias
 
         probs = torch.softmax(logits[:, -1], dim=-1)
         next_token = torch.multinomial(probs, num_samples=1).reshape(-1)
@@ -245,14 +297,18 @@ def fork_rollout(
         for row in range(max_rows):
             if not is_active[row].item() or is_finished[row].item():
                 continue
+            base_row = row if row < bsz else row - bsz
+            if race_solved[base_row]:
+                is_finished[row] = True
+                continue
             if input_text_mask[row, cur_pos].item():
                 continue  # still in prompt
 
             tok_id = next_token[row].item()
             tok_text = tokenizer.detokenize([tok_id])
 
-            # Check for fork token
-            if tok_id == fork_token_id:
+            # Treat <fork>, <fork1>, and <fork2> as fork events.
+            if tok_id in fork_event_token_ids:
                 base_row = row if row < bsz else row - bsz
                 parser = parsers[row]
                 is_valid = parser.register_fork()
@@ -291,38 +347,29 @@ def fork_rollout(
                 # Feed token to parser
                 parsers[row].feed(tok_text)
 
-            # Check for forced fork (warmup curriculum)
-            base_row = row if row < bsz else row - bsz
-            if (force_fork_flags[base_row] and not has_forked[base_row]
-                    and row < bsz  # only from branch A
-                    and parsers[row].state.name == "IN_THINK"
-                    and gen_step > 5  # wait a few steps into thinking
-                    and tok_id != fork_token_id):
-                # Force a fork by injecting fork logic
-                branch_b_row = base_row + bsz
-                has_forked[base_row] = True
-                fork_step[row] = gen_step
-                fork_step[branch_b_row] = gen_step
-                parsers[row].register_fork()
-
-                # Clone KV cache and tokens
-                for layer in model.layers:
-                    attn = layer.self_attn
-                    attn.cache_k[branch_b_row, :cur_pos+1] = attn.cache_k[row, :cur_pos+1]
-                    attn.cache_v[branch_b_row, :cur_pos+1] = attn.cache_v[row, :cur_pos+1]
-                tokens[branch_b_row, :cur_pos+1] = tokens[row, :cur_pos+1]
-                input_text_mask[branch_b_row, :cur_pos+1] = input_text_mask[row, :cur_pos+1]
-                is_active[branch_b_row] = True
-                parsers[branch_b_row] = parsers[row].clone()
-                force_fork_flags[base_row] = False  # only force once
-
             # Check for end token
             if tok_id == end_token_id:
                 is_finished[row] = True
 
             # Check for complete answer (race logic)
             if parsers[row].has_complete_answer:
-                is_finished[row] = True
+                verify = reward_function(
+                    response=parsers[row].text,
+                    numbers=batch.numbers[question_idx[row]],
+                    target=batch.target[question_idx[row]],
+                    end_token=end_token,
+                )
+                answer_correct = verify["reward_info"].get("answer_reward", 0.0) > 0.5
+                if answer_correct:
+                    race_solved[base_row] = True
+                    # First correct answer wins; terminate the whole race pair.
+                    is_finished[base_row] = True
+                    branch_b_row = base_row + bsz
+                    if has_forked[base_row]:
+                        is_finished[branch_b_row] = True
+                else:
+                    # Incorrect complete answer only terminates this branch.
+                    is_finished[row] = True
 
         prev_pos = cur_pos
 
@@ -381,31 +428,14 @@ def fork_rollout(
             correct_b = reward_b["reward_info"]["answer_reward"] > 0.5
 
         # Determine winner and compute fork reward
-        any_correct = correct_a or correct_b
-
-        # Compute latency proxy
+        any_correct = race_solved[i]
+        t_proxy = t_proxy_ms[i]
         fs = fork_step[i]
-        if forked and fs is not None:
-            steps_before = fs
-            steps_after_a = len(branch_a_gen) - fs
-            steps_after_b = len(branch_b_gen) - fs if branch_b_gen else 0
-        else:
-            steps_before = len(branch_a_gen)
-            steps_after_a = 0
-            steps_after_b = 0
-
-        t_proxy = compute_latency_proxy(
-            steps_before_fork=max(steps_before, 0),
-            steps_after_fork_branch_a=max(steps_after_a, 0),
-            steps_after_fork_branch_b=max(steps_after_b, 0),
-            forked=forked,
-            config=fork_reward_config,
-        )
 
         fork_rwd = compute_fork_reward(
             correct=any_correct,
             t_proxy_ms=t_proxy,
-            invalid_fork=invalid_fork_flags[i],
+            invalid_fork=invalid_fork_flags[i] or invalid_fork_flags[branch_b_row],
             config=fork_reward_config,
         )
 

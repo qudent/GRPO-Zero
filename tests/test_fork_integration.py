@@ -17,7 +17,8 @@ from dataclasses import replace
 from data_types import Episode, MiniBatch
 from fork_parser import ForkParser, ParserState
 from fork_reward import ForkRewardConfig, compute_fork_reward, compute_token_weights
-from grpo import normalize_rewards_per_group, update_policy_fork
+from grpo import fork_rollout, normalize_rewards_per_group, update_policy_fork
+from countdown_task import reward_function
 
 
 class TestRaceWinnerLogic:
@@ -231,3 +232,186 @@ class TestInvalidForkPenalty:
         invalid = compute_fork_reward(False, 50.0, True, config)
         assert valid["reward"] == pytest.approx(-0.2)
         assert invalid["reward"] == pytest.approx(-0.4)
+
+
+class ScriptTokenizer:
+    """Tokenizer for deterministic fork-race behavior tests."""
+
+    PAD = 0
+    EOS = 1
+    FORK = 2
+    FORK1 = 3
+    FORK2 = 4
+    FILL = 5
+    ANSWER_OPEN = 6
+    ANSWER_EXPR = 7
+    ANSWER_CLOSE = 8
+
+    def __init__(self):
+        self.pad_token = "<pad>"
+        self.pad_token_id = self.PAD
+        self.eos_token = "<eos>"
+        self.eos_token_id = self.EOS
+        self.fork_token_id = self.FORK
+        self.fork1_token_id = self.FORK1
+        self.fork2_token_id = self.FORK2
+        self._vocab_size = 32
+        self._decode_map = {
+            self.PAD: "",
+            self.EOS: "<eos>",
+            self.FORK: "<fork>",
+            self.FORK1: "<fork1>",
+            self.FORK2: "<fork2>",
+            self.FILL: "x",
+            self.ANSWER_OPEN: "</think>\n<answer>",
+            self.ANSWER_EXPR: "1+2+3",
+            self.ANSWER_CLOSE: "</answer>",
+        }
+
+    @property
+    def vocab_size(self):
+        return self._vocab_size
+
+    def detokenize(self, token_ids):
+        return "".join(self._decode_map.get(tid, "t") for tid in token_ids)
+
+
+class ScriptAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.n_kv_heads = 1
+        self.head_dim = 1
+        self.cache_k = None
+        self.cache_v = None
+
+    def init_kv_cache(self, max_batch_size, max_seq_len, dtype, device):
+        shape = (max_batch_size, max_seq_len, self.n_kv_heads, self.head_dim)
+        self.cache_k = torch.zeros(shape, dtype=dtype, device=device)
+        self.cache_v = torch.zeros(shape, dtype=dtype, device=device)
+
+    def del_kv_cache(self):
+        self.cache_k = None
+        self.cache_v = None
+
+
+class ScriptBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = ScriptAttention()
+
+
+class ScriptModel(torch.nn.Module):
+    """Deterministic model to force a known fork + race outcome."""
+
+    def __init__(self, tokenizer: ScriptTokenizer, fork_emit_token_id: int | None = None):
+        super().__init__()
+        self.tok = tokenizer
+        self.layers = torch.nn.ModuleList([ScriptBlock()])
+        self.vocab_size = tokenizer.vocab_size
+        self.fork_emit_token_id = (
+            tokenizer.FORK if fork_emit_token_id is None else int(fork_emit_token_id)
+        )
+
+    def init_kv_cache(self, max_batch_size, max_seq_len, device, dtype):
+        for layer in self.layers:
+            layer.self_attn.init_kv_cache(max_batch_size, max_seq_len, dtype, device)
+
+    def del_kv_cache(self):
+        for layer in self.layers:
+            layer.self_attn.del_kv_cache()
+
+    def inference(self, tokens, start_pos):
+        bsz = tokens.shape[0]
+        last = tokens[:, -1]
+        logits = torch.full(
+            (bsz, 1, self.vocab_size),
+            -1e9,
+            dtype=torch.float32,
+            device=tokens.device,
+        )
+
+        # Default behavior: emit filler token.
+        next_ids = torch.full((bsz,), self.tok.FILL, dtype=torch.long, device=tokens.device)
+        # Emit a fork-like token at the second decode step (start_pos == 1).
+        if int(start_pos) == 1:
+            next_ids[:] = self.fork_emit_token_id
+        else:
+            # After branching, branch A (seen <fork1>) emits a correct answer quickly.
+            next_ids = torch.where(last == self.tok.FORK1, self.tok.ANSWER_OPEN, next_ids)
+            next_ids = torch.where(last == self.tok.ANSWER_OPEN, self.tok.ANSWER_EXPR, next_ids)
+            next_ids = torch.where(last == self.tok.ANSWER_EXPR, self.tok.ANSWER_CLOSE, next_ids)
+
+        logits.scatter_(2, next_ids.view(bsz, 1, 1), 0.0)
+        return logits
+
+
+class TestForkRaceSemantics:
+    def test_first_correct_terminates_race_and_reduces_latency(self):
+        """A correct branch should stop the sibling branch immediately."""
+        tokenizer = ScriptTokenizer()
+        model = ScriptModel(tokenizer)
+
+        batch = MiniBatch(
+            prefix=["prompt<think>"],
+            prefix_tokens=[["prompt", "<think>"]],
+            prefix_token_ids=[[9]],
+            numbers=[[1, 2, 3]],
+            target=[6],
+        )
+
+        episodes = fork_rollout(
+            model=model,
+            tokenizer=tokenizer,
+            batch=batch,
+            max_gen_len=12,
+            num_answer_per_question=1,
+            reward_function=reward_function,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            fork_reward_config=ForkRewardConfig(c1_ms=1.0, c2_ms=1.5),
+            fork_token_logit_bias=0.0,
+            fork_token_target_prob=None,
+        )
+
+        assert len(episodes) == 2
+        assert {ep.branch_id for ep in episodes} == {0, 1}
+        assert all(ep.reward_info.get("forked", 0.0) == pytest.approx(1.0) for ep in episodes)
+        assert max(len(ep.generated_token_ids) for ep in episodes) <= 5
+        # Latency proxy is accumulated only until first-correct answer:
+        # c1 + c1 + c2 + c2 + c2 = 6.5ms in this scripted rollout.
+        assert all(ep.reward_info["t_proxy_ms"] == pytest.approx(6.5) for ep in episodes)
+
+        by_branch = {ep.branch_id: ep for ep in episodes}
+        assert by_branch[0].reward_info["answer_reward"] == pytest.approx(1.0)
+        assert by_branch[1].reward_info["answer_reward"] == pytest.approx(0.0)
+
+    @pytest.mark.parametrize("fork_emit_token_id", [ScriptTokenizer.FORK1, ScriptTokenizer.FORK2])
+    def test_branch_tokens_also_trigger_fork_event(self, fork_emit_token_id):
+        tokenizer = ScriptTokenizer()
+        model = ScriptModel(tokenizer, fork_emit_token_id=fork_emit_token_id)
+
+        batch = MiniBatch(
+            prefix=["prompt<think>"],
+            prefix_tokens=[["prompt", "<think>"]],
+            prefix_token_ids=[[9]],
+            numbers=[[1, 2, 3]],
+            target=[6],
+        )
+
+        episodes = fork_rollout(
+            model=model,
+            tokenizer=tokenizer,
+            batch=batch,
+            max_gen_len=12,
+            num_answer_per_question=1,
+            reward_function=reward_function,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            fork_reward_config=ForkRewardConfig(c1_ms=1.0, c2_ms=1.5),
+            fork_token_logit_bias=0.0,
+            fork_token_target_prob=None,
+        )
+
+        assert len(episodes) == 2
+        assert {ep.branch_id for ep in episodes} == {0, 1}
+        assert all(ep.reward_info.get("forked", 0.0) == pytest.approx(1.0) for ep in episodes)
