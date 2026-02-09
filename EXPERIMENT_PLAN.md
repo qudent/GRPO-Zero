@@ -27,13 +27,13 @@ Secondary metrics:
 
 ## 3) Critical Risks and Fixes (From Prior Critique)
 
-### Risk A: Confounded comparisons (more compute looks better)
+### Risk A: No fair baseline for "learned branching" under a latency goal
 Fix:
-- Include **compute-matched controls** and wall-clock budgets:
-1. `single-path`: normal decoding (no fork token used).
-2. `external-race-2`: two independent normal samples raced externally.
-3. `internal-fork-race-2`: proposed method.
-- Compare at equal wall-clock budget (e.g., 1500 ms, 2500 ms).
+- Use **latency/cost-budgeted controls** (not compute-matched) with the same max parallelism cap:
+1. `single-path`: normal decoding (no branching).
+2. `external-race-2`: always run two independent samples in parallel from step 0.
+3. `internal-fork-race-2`: learned token-level fork timing.
+- Compare methods at fixed wall-clock budgets (e.g., 1500 ms, 2500 ms) and report cost-per-correct.
 
 ### Risk B: Sparse reward => no fork behavior emerges
 Fix:
@@ -111,18 +111,20 @@ Termination:
 - If a branch emits complete incorrect answer -> terminate that branch only.
 - Stop rollout when all branches terminated or max length reached.
 
-## 6) Compute-Matched Experimental Protocol (Signal-Focused)
+## 6) Wall-Clock-Budget Experimental Protocol (Signal-Focused)
 
 Held-out evaluation set is fixed and shared across all methods.
 
 For each method (`single-path`, `external-race-2`, `internal-fork-race-2`):
 - Run with identical model checkpoint.
 - Measure across same prompts and same random-seed set.
-- Evaluate at fixed wall-clock budgets (e.g., 1.5s and 2.5s).
+- Run on the same hardware class with max parallelism capped at 2 branches.
+- Evaluate at fixed wall-clock budgets (e.g., 1.5s and 2.5s), then compare cost-per-correct.
 
 Main questions:
 1. At equal wall-clock budget, does internal fork-race increase success@budget?
 2. At equal success target, does internal fork-race reduce p50/p90 `TTFC_ms`?
+3. Versus `external-race-2`, does learned fork timing reduce cost-per-correct at similar success?
 
 ## 7) Statistical Plan (Avoid False Signal)
 
@@ -130,7 +132,7 @@ Main questions:
 - For each metric, report mean and 95% bootstrap CI across prompts.
 - Predefine success criterion:
   - internal-fork-race improves success@budget by >= 5 absolute points over single-path
-  - and is non-inferior to external-race-2 on success while improving p50 `TTFC_ms` by >= 10%.
+  - and is non-inferior to external-race-2 on success while improving either p50 `TTFC_ms` or cost-per-correct by >= 10%.
 
 If criterion fails, treat v0 as negative/neutral signal and do not escalate complexity.
 
@@ -197,4 +199,4 @@ Artifacts to keep:
 
 ---
 
-This v0 plan is intentionally strict: if internal fork-race cannot beat compute-matched controls on wall-clock metrics, we stop and reassess instead of adding complexity.
+This v0 plan is intentionally strict: if internal fork-race cannot beat latency/cost-budgeted baselines on wall-clock metrics, we stop and reassess instead of adding complexity.
