@@ -1,0 +1,22 @@
+model:
+  pretrained_model_path: "Qwen2.5-3B-Instruct"
+  device: "cuda"
+  dtype: "bfloat16"
+data:
+  path: "Countdown-Tasks-3to4"
+  test_size: 128
+training:
+  random_seed: 1337
+  max_gen_len: 512
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+sft_warmup:
+  vanilla_checkpoint: "ckpt_fork_real/ckpt_000050.pt"
+  num_data_batches: 20
+  sft_steps: 80
+  learning_rate: 5.0e-6
+  fork_target_prob: 0.25
+  data_answers_per_question: 4
+  data_batch_size: 8
+  output_checkpoint: "ckpt_sft_fork/ckpt_sft_fork.pt"
+  log_dir: "logs_sft_fork"
