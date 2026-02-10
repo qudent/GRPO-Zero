@@ -18,7 +18,7 @@ from qwen2_model import Transformer
 from tokenizer import Tokenizer
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def rollout(
     model: Transformer,
     batch: MiniBatch,
@@ -120,7 +120,7 @@ def rollout(
     return episodes
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def fork_rollout(
     model: Transformer,
     batch: MiniBatch,
@@ -133,11 +133,16 @@ def fork_rollout(
     fork_reward_config: Optional[ForkRewardConfig] = None,
     fork_token_logit_bias: float = 0.0,
     fork_token_target_prob: Optional[float] = None,
+    warmup_fork_fraction: float = 1.0,
 ) -> List[Episode]:
     """Fork-aware rollout with branch racing and early stop.
 
     Each row can fork at most once, creating a branch B copy.
     Pre-allocates 2*bsz KV rows. Branch B rows live at index bsz+i.
+
+    warmup_fork_fraction: fraction of rows (per question group) that get
+    the fork probability injection during warmup. Set < 1.0 to keep some
+    non-forked baselines so GRPO can learn the value of forking.
     """
     if fork_reward_config is None:
         fork_reward_config = ForkRewardConfig()
@@ -214,6 +219,19 @@ def fork_rollout(
     # Latency proxy accumulated online until first-correct answer.
     t_proxy_ms = [0.0] * bsz
 
+    # Select which rows get warmup fork injection (per-question balanced)
+    warmup_eligible = [False] * bsz
+    if fork_token_target_prob is not None and warmup_fork_fraction < 1.0:
+        import random as _rand
+        for q in range(len(batch.prefix)):
+            q_rows = [r for r in range(bsz) if question_idx[r] == q]
+            n_inject = max(1, round(len(q_rows) * warmup_fork_fraction))
+            chosen = _rand.sample(q_rows, n_inject)
+            for r in chosen:
+                warmup_eligible[r] = True
+    else:
+        warmup_eligible = [True] * bsz
+
     for cur_pos in range(min_prompt_len, total_len):
         active_count = is_active.sum().item()
         if active_count == 0:
@@ -245,25 +263,13 @@ def fork_rollout(
             logits = model.inference(tokens[:max_rows, prev_pos:cur_pos], prev_pos)
 
         # Optional warmup signal: increase <fork> probability where a fork is valid.
-        # If target probability is provided, map logits to that exact target.
-        if fork_token_target_prob is not None:
-            eps = 1e-6
-            target_p = float(min(max(fork_token_target_prob, eps), 1.0 - eps))
-            target_logit = math.log(target_p / (1.0 - target_p))
-            for row in range(bsz):
-                if not is_active[row].item() or is_finished[row].item():
-                    continue
-                if has_forked[row].item():
-                    continue
-                if not parsers[row].check_fork_valid():
-                    continue
-                row_logits = logits[row, -1]
-                row_probs = torch.softmax(row_logits, dim=-1)
-                current_p = float(row_probs[fork_token_id].item())
-                current_p = min(max(current_p, eps), 1.0 - eps)
-                current_logit = math.log(current_p / (1.0 - current_p))
-                logits[row, -1, fork_token_id] += target_logit - current_logit
-        elif fork_token_logit_bias != 0.0:
+        # Uses direct probability injection to avoid bfloat16 precision issues
+        # with the logit adjustment approach (fork token logits are extremely
+        # negative for unused embeddings, and eps clamping makes delta insufficient).
+        probs = torch.softmax(logits[:, -1], dim=-1)
+
+        if fork_token_logit_bias != 0.0 and fork_token_target_prob is None:
+            # Legacy logit bias path (not used during warmup)
             for row in range(bsz):
                 if not is_active[row].item() or is_finished[row].item():
                     continue
@@ -271,8 +277,30 @@ def fork_rollout(
                     continue
                 if parsers[row].check_fork_valid():
                     logits[row, -1, fork_token_id] += fork_token_logit_bias
+            probs = torch.softmax(logits[:, -1], dim=-1)
 
-        probs = torch.softmax(logits[:, -1], dim=-1)
+        if fork_token_target_prob is not None:
+            target_p = float(min(max(fork_token_target_prob, 1e-6), 1.0 - 1e-6))
+            for row in range(bsz):
+                if not warmup_eligible[row]:
+                    continue
+                if not is_active[row].item() or is_finished[row].item():
+                    continue
+                if has_forked[row].item():
+                    continue
+                if input_text_mask[row, cur_pos].item():
+                    continue  # still in prompt, skip
+                if not parsers[row].check_fork_valid():
+                    continue
+                # Zero out fork prob, rescale others to (1-target_p), set fork to target_p
+                row_probs = probs[row]
+                fork_p = row_probs[fork_token_id].item()
+                other_sum = 1.0 - fork_p
+                if other_sum > 0:
+                    scale = (1.0 - target_p) / other_sum
+                    probs[row] = row_probs * scale
+                probs[row, fork_token_id] = target_p
+
         next_token = torch.multinomial(probs, num_samples=1).reshape(-1)
 
         # For prompt positions, use the original token
@@ -619,6 +647,7 @@ def update_policy_fork(
     max_grad_norm: float,
     device: torch.device,
     dtype: torch.dtype,
+    entropy_coef: float = 0.0,
 ):
     """Update policy with token-weighted GRPO for fork-race episodes.
 
@@ -704,6 +733,10 @@ def update_policy_fork(
         # Weighted objective: log_prob * advantage * token_weight
         obj = log_probs * batch_advantages[:, None] * target_weights
         obj = obj.sum() / total_token_weight
+        # Entropy bonus to prevent mode collapse
+        if entropy_coef > 0:
+            entropy_bonus = (token_entropy * target_binary_mask).sum() / total_token_weight
+            obj = obj + entropy_coef * entropy_bonus
         loss = -obj
         loss.backward()
 
