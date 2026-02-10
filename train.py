@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard.writer import SummaryWriter
 
 from countdown_task import CountdownTasksDataset, reward_function
+from fork_metrics import episode_correct, primary_episodes
 from fork_reward import ForkRewardConfig
 from grpo import fork_rollout, rollout, update_policy, update_policy_fork
 from optimizer import MemoryEfficientAdamW
@@ -84,16 +85,21 @@ def evaluate(
                 dtype=dtype,
             )
         batch_ms = (time.perf_counter() - t0) * 1000.0
+        metric_episodes = primary_episodes(episodes) if use_fork_rollout else episodes
 
-        if episodes:
+        if metric_episodes:
             # This is a rollout-level timing proxy for evaluation throughput.
-            per_episode_ms = batch_ms / len(episodes)
-            ttfc_ms.extend([per_episode_ms] * len(episodes))
-            success.extend([episode.reward_info["answer_reward"] for episode in episodes])
+            per_episode_ms = batch_ms / len(metric_episodes)
+            ttfc_ms.extend([per_episode_ms] * len(metric_episodes))
+            success.extend([episode_correct(episode) for episode in metric_episodes])
 
         if use_fork_rollout:
-            fork_rate.extend([episode.reward_info.get("forked", 0.0) for episode in episodes])
-            t_proxy_ms.extend([episode.reward_info.get("t_proxy_ms", 0.0) for episode in episodes])
+            fork_rate.extend(
+                [episode.reward_info.get("forked", 0.0) for episode in metric_episodes]
+            )
+            t_proxy_ms.extend(
+                [episode.reward_info.get("t_proxy_ms", 0.0) for episode in metric_episodes]
+            )
 
         if max_eval_batches is not None and batch_idx >= max_eval_batches:
             break
@@ -153,6 +159,11 @@ def main(config_path: str, max_steps_override: int | None = None):
         max_steps = config["training"].get("max_steps", None)
     if max_steps is not None and max_steps <= 0:
         raise ValueError("max_steps must be > 0 if provided")
+    text_log_episodes_per_step = int(
+        config["training"].get("text_log_episodes_per_step", 4)
+    )
+    if text_log_episodes_per_step < 0:
+        raise ValueError("training.text_log_episodes_per_step must be >= 0")
 
     current_time = datetime.now().strftime(r"%Y%m%d-%H%M%S")
     tb_writer = SummaryWriter(log_dir=f"{config['training']['log_dir']}/{current_time}")
@@ -272,6 +283,10 @@ def main(config_path: str, max_steps_override: int | None = None):
             print(f"\rStep {step}: no episodes after filtering, skipping update.")
             continue
 
+        metric_episodes = primary_episodes(episodes) if fork_enabled else episodes
+        if not metric_episodes:
+            metric_episodes = episodes
+
         if fork_enabled:
             entropy_coef = fork_config.get("entropy_coef", 0.0)
             results = update_policy_fork(
@@ -303,12 +318,12 @@ def main(config_path: str, max_steps_override: int | None = None):
         start_time = end_time
 
         # compute and log important metrics
-        reward = [episode.reward for episode in episodes]
+        reward = [episode.reward for episode in metric_episodes]
         formatted_reward = [
-            episode.reward_info["format_reward"] for episode in episodes
+            episode.reward_info["format_reward"] for episode in metric_episodes
         ]
-        answer_reward = [episode.reward_info["answer_reward"] for episode in episodes]
-        num_finished_episodes = sum(episode.is_finished for episode in episodes)
+        answer_reward = [episode_correct(episode) for episode in metric_episodes]
+        num_finished_episodes = sum(episode.is_finished for episode in metric_episodes)
         mean_reward = np.mean(reward)
         std_reward = np.std(reward)
         success_rate = np.mean(answer_reward)
@@ -318,7 +333,7 @@ def main(config_path: str, max_steps_override: int | None = None):
         lr = optimizer.param_groups[0]["lr"]
         loss = results["loss"]
         mean_response_len = np.mean(
-            [len(episode.generated_token_ids) for episode in episodes]
+            [len(episode.generated_token_ids) for episode in metric_episodes]
         )
 
         # Fork-specific metrics
@@ -326,10 +341,10 @@ def main(config_path: str, max_steps_override: int | None = None):
         mean_t_proxy = 0.0
         if fork_enabled:
             fork_rate = np.mean([
-                episode.reward_info.get("forked", 0.0) for episode in episodes
+                episode.reward_info.get("forked", 0.0) for episode in metric_episodes
             ])
             mean_t_proxy = np.mean([
-                episode.reward_info.get("t_proxy_ms", 0.0) for episode in episodes
+                episode.reward_info.get("t_proxy_ms", 0.0) for episode in metric_episodes
             ])
 
         print(
@@ -385,7 +400,7 @@ def main(config_path: str, max_steps_override: int | None = None):
             tb_writer.add_scalar("fork_rate", fork_rate, step)
             tb_writer.add_scalar("T_proxy_ms", mean_t_proxy, step)
 
-        for i, episode in enumerate(episodes):
+        for i, episode in enumerate(metric_episodes[:text_log_episodes_per_step]):
             # TensorBoard treats text as markdown.
             text = html.escape(episode.text)
             tb_writer.add_text(f"text_{i}", f"<pre>{text}</pre>", step)

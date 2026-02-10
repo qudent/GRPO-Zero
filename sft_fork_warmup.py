@@ -25,6 +25,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 
 from countdown_task import CountdownTasksDataset, reward_function
 from data_types import Episode
+from fork_metrics import episode_correct, primary_episodes
 from fork_reward import ForkRewardConfig
 from grpo import fork_rollout
 from optimizer import MemoryEfficientAdamW
@@ -350,8 +351,11 @@ def main(config_path: str):
     fork1_id = tokenizer.fork1_token_id
     fork2_id = tokenizer.fork2_token_id
     fork_token_ids_set = {fork_id, fork1_id, fork2_id}
-    has_fork = sum(1 for e in fork_episodes
-                   if fork_id in e.generated_token_ids or fork1_id in e.generated_token_ids)
+    has_fork = sum(
+        1
+        for e in fork_episodes
+        if any(token_id in fork_token_ids_set for token_id in e.generated_token_ids)
+    )
     print(f"Episodes with fork token: {has_fork}/{len(fork_episodes)}")
 
     # SFT training with fork-weighted loss
@@ -443,8 +447,17 @@ def main(config_path: str):
         fork_reward_config=frc,
         fork_token_logit_bias=0.0, fork_token_target_prob=None,
     )
-    success = np.mean([e.reward_info.get("answer_reward", 0) for e in test_episodes])
-    forks = np.mean([e.reward_info.get("forked", 0) for e in test_episodes])
+    metric_episodes = primary_episodes(test_episodes)
+    success = (
+        np.mean([episode_correct(e) for e in metric_episodes])
+        if metric_episodes
+        else 0.0
+    )
+    forks = (
+        np.mean([e.reward_info.get("forked", 0) for e in metric_episodes])
+        if metric_episodes
+        else 0.0
+    )
     print(f"Post-SFT eval: success_rate={success:.4f}, natural_fork_rate={forks:.4f}")
 
     # Save checkpoint

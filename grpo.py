@@ -207,6 +207,8 @@ def fork_rollout(
     parsers = [ForkParser() for _ in range(max_rows)]
     for row in range(bsz):
         parsers[row] = _init_parser_for_prompt(batch.prefix[question_idx[row]])
+    # Cache single-token detokenization lookups for parser feeding.
+    token_text_cache: Dict[int, str] = {}
 
     # Per-row fork metadata
     fork_step = [None] * max_rows  # step at which fork occurred
@@ -333,7 +335,6 @@ def fork_rollout(
                 continue  # still in prompt
 
             tok_id = next_token_cpu[row]
-            tok_text = tokenizer.detokenize([tok_id])
 
             # Treat <fork>, <fork1>, and <fork2> as fork events.
             if tok_id in fork_event_token_ids:
@@ -373,6 +374,10 @@ def fork_rollout(
                     parsers[row].invalid_fork = True
             else:
                 # Feed token to parser
+                tok_text = token_text_cache.get(tok_id)
+                if tok_text is None:
+                    tok_text = tokenizer.detokenize([tok_id])
+                    token_text_cache[tok_id] = tok_text
                 parsers[row].feed(tok_text)
 
             # Check for end token

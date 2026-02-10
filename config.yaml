@@ -24,6 +24,8 @@ training:
   skip_unfinished_episodes: false
   ckpt_save_interval: 100
   eval_interval: 10
+  # Cap per-step text logging to reduce TensorBoard overhead.
+  text_log_episodes_per_step: 4
   memory_efficient_adamw: false
 evaluation:
   # If enabled, eval uses fork_rollout with no warmup fork targeting.

@@ -1,6 +1,6 @@
 model:
   pretrained_model_path: "Qwen2.5-3B-Instruct"
-  device: "cuda"
+  device: "cpu"
   dtype: "bfloat16"
 data:
   path: "Countdown-Tasks-3to4"
@@ -8,11 +8,11 @@ data:
 training:
   random_seed: 1337
   max_prompt_len: 256
-  max_gen_len: 1024
-  batch_size: 256
-  num_questions_per_batch: 32
-  # Number of examples per gradient accumulation step
-  micro_batch_size: 2
+  max_gen_len: 16
+  max_steps: 3
+  batch_size: 4
+  num_questions_per_batch: 2
+  micro_batch_size: 1
   max_grad_norm: 1.0
   learning_rate: 1.0e-5
   weight_decay: 0.0
@@ -21,8 +21,9 @@ training:
   log_dir: "logs"
   skip_unfinished_episodes: false
   ckpt_save_interval: 100
-  eval_interval: 10
-  # Cap per-step text logging to reduce TensorBoard overhead.
+  eval_interval: 3
   text_log_episodes_per_step: 4
-  # save GPU memory by offloading the optimizer states to CPU
-  memory_efficient_adamw: true
+  memory_efficient_adamw: false
+evaluation:
+  use_fork_rollout: false
+  max_eval_batches: 1
