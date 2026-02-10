@@ -245,12 +245,19 @@ def fork_rollout(
         if not active_mask.any():
             break
 
+        # Batch GPU → CPU transfers: one sync instead of per-row .item() calls
+        active_mask_cpu = active_mask.tolist()
+        is_active_cpu = is_active.tolist()
+        is_finished_cpu = is_finished.tolist()
+        has_forked_cpu = has_forked.tolist()
+        input_mask_cur_cpu = input_text_mask[:max_rows, cur_pos].tolist()
+
         # Accumulate wall-clock latency proxy per base row up to first-correct.
         for base_row in range(bsz):
             if race_solved[base_row]:
                 continue
-            active_branches = int(active_mask[base_row].item())
-            active_branches += int(active_mask[base_row + bsz].item())
+            active_branches = int(active_mask_cpu[base_row])
+            active_branches += int(active_mask_cpu[base_row + bsz])
             if active_branches == 1:
                 t_proxy_ms[base_row] += fork_reward_config.c1_ms
             elif active_branches >= 2:
@@ -268,9 +275,9 @@ def fork_rollout(
         if fork_token_logit_bias != 0.0 and fork_token_target_prob is None:
             # Legacy logit bias path (not used during warmup)
             for row in range(bsz):
-                if not is_active[row].item() or is_finished[row].item():
+                if not is_active_cpu[row] or is_finished_cpu[row]:
                     continue
-                if has_forked[row].item():
+                if has_forked_cpu[row]:
                     continue
                 if parsers[row].check_fork_valid():
                     logits[row, -1, fork_token_id] += fork_token_logit_bias
@@ -281,11 +288,11 @@ def fork_rollout(
             for row in range(bsz):
                 if not warmup_eligible[row]:
                     continue
-                if not is_active[row].item() or is_finished[row].item():
+                if not is_active_cpu[row] or is_finished_cpu[row]:
                     continue
-                if has_forked[row].item():
+                if has_forked_cpu[row]:
                     continue
-                if input_text_mask[row, cur_pos].item():
+                if input_mask_cur_cpu[row]:
                     continue  # still in prompt, skip
                 if not parsers[row].check_fork_valid():
                     continue
@@ -300,14 +307,7 @@ def fork_rollout(
 
         next_token = torch.multinomial(probs, num_samples=1).reshape(-1)
 
-        # For prompt positions, use the original token
-        for row in range(max_rows):
-            if not is_active[row] or is_finished[row]:
-                continue
-            if cur_pos < len(prefix_token_ids[question_idx[row]]) if row < bsz else False:
-                if input_text_mask[row, cur_pos]:
-                    next_token[row] = tokens[row, cur_pos]
-
+        # Apply prompt token masking and finished/inactive padding (vectorized)
         next_token = torch.where(
             input_text_mask[:max_rows, cur_pos],
             tokens[:max_rows, cur_pos],
@@ -317,19 +317,22 @@ def fork_rollout(
         next_token = torch.where(~is_active[:max_rows], pad_token_id, next_token)
         tokens[:max_rows, cur_pos] = next_token
 
+        # Batch next_token to CPU for the per-row processing loop
+        next_token_cpu = next_token[:max_rows].tolist()
+
         # Process each active row for fork/answer detection
         gen_step = cur_pos - min_prompt_len
         for row in range(max_rows):
-            if not is_active[row].item() or is_finished[row].item():
+            if not is_active_cpu[row] or is_finished_cpu[row]:
                 continue
             base_row = row if row < bsz else row - bsz
             if race_solved[base_row]:
                 is_finished[row] = True
                 continue
-            if input_text_mask[row, cur_pos].item():
+            if input_mask_cur_cpu[row]:
                 continue  # still in prompt
 
-            tok_id = next_token[row].item()
+            tok_id = next_token_cpu[row]
             tok_text = tokenizer.detokenize([tok_id])
 
             # Treat <fork>, <fork1>, and <fork2> as fork events.
