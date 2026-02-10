@@ -239,6 +239,7 @@ def main(config_path: str, max_steps_override: int | None = None):
         if fork_enabled:
             # Warmup: set <fork> token probability target on valid fork states.
             current_fork_target_prob = warmup_fork_target_prob if step <= n_warmup else None
+            warmup_fork_fraction = float(fork_config.get("warmup_fork_fraction", 0.5))
             episodes = fork_rollout(
                 model=model,
                 tokenizer=tokenizer,
@@ -251,6 +252,7 @@ def main(config_path: str, max_steps_override: int | None = None):
                 fork_reward_config=fork_reward_config,
                 fork_token_logit_bias=0.0,
                 fork_token_target_prob=current_fork_target_prob,
+                warmup_fork_fraction=warmup_fork_fraction,
             )
         else:
             episodes = rollout(
@@ -271,6 +273,7 @@ def main(config_path: str, max_steps_override: int | None = None):
             continue
 
         if fork_enabled:
+            entropy_coef = fork_config.get("entropy_coef", 0.0)
             results = update_policy_fork(
                 model=model,
                 optimizer=optimizer,
@@ -280,6 +283,7 @@ def main(config_path: str, max_steps_override: int | None = None):
                 max_grad_norm=config["training"]["max_grad_norm"],
                 device=device,
                 dtype=dtype,
+                entropy_coef=entropy_coef,
             )
         else:
             results = update_policy(

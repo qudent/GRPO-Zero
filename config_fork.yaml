@@ -35,3 +35,5 @@ fork_race:
   # Warmup curriculum
   n_warmup: 50              # warmup steps with fork-token probability targeting
   warmup_fork_target_prob: 0.25  # target P(<fork>) for valid rows during warmup
+  warmup_fork_fraction: 0.5     # inject fork on 50% of rows per group
+  entropy_coef: 0.02            # entropy bonus to prevent mode collapse

@@ -10,7 +10,7 @@ training:
   max_prompt_len: 256
   max_gen_len: 512
   # null => run full dataloader pass (no artificial step cap).
-  max_steps: null
+  max_steps: 500
   batch_size: 64
   num_questions_per_batch: 8
   micro_batch_size: 1
@@ -38,3 +38,5 @@ fork_race:
   c2_ms: 1.5
   n_warmup: 50
   warmup_fork_target_prob: 0.25
+  warmup_fork_fraction: 0.5       # inject fork on 50% of rows per group
+  entropy_coef: 0.02
