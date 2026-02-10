@@ -9,13 +9,16 @@ from data_types import MiniBatch
 from tokenizer import Tokenizer
 
 SYSTEM_MESSAGE = (
-    "You are a helpful assistant. You first think about the reasoning process "
-    "in your mind and then provide the user with the answer."
+    "You are a helpful assistant. Think step by step in <think> </think> and "
+    "then provide the final equation in <answer> </answer>. "
+    "If useful, you may emit <fork> once inside <think> to branch your reasoning."
 )
 USER_TEMPLATE = (
     "Using the numbers {numbers}, create an equation that equals {target}. "
     "You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. "
     "Show your work in <think> </think> tags. "
+    "If helpful, use <fork> once inside <think> to explore alternatives. "
+    "Do not place <fork> inside <answer>. "
     "And return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>."
 )
 RESPONSE_PROMPT = "Let me solve this step by step.\n<think>"
