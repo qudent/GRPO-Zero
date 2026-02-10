@@ -96,12 +96,14 @@ def sft_step(
     dtype: torch.dtype,
     max_seq_len: int = 512,
     episodes_per_step: int = 64,
+    fork_token_ids: set = None,
+    fork_weight: float = 100.0,
 ) -> dict:
     """One step of supervised fine-tuning on fork episodes.
 
-    Cross-entropy loss on the FULL generated sequence, including the fork token.
-    This teaches the model P(fork_token | prefix_context) directly.
-    Samples a subset of episodes per step for efficiency.
+    Cross-entropy loss on the FULL generated sequence, with fork token
+    positions weighted fork_weight times higher to focus learning on
+    the rare fork token emission.
     """
     # Sample a subset and shuffle
     if len(episodes) > episodes_per_step:
@@ -111,14 +113,11 @@ def sft_step(
     random.shuffle(step_episodes)
     step_episodes.sort(key=lambda x: len(x.prefix_token_ids) + len(x.generated_token_ids))
 
-    total_tokens = sum(
-        min(len(e.generated_token_ids), max_seq_len - len(e.prefix_token_ids))
-        for e in step_episodes
-    )
-    if total_tokens <= 0:
+    if not step_episodes:
         return {"loss": 0.0, "grad_norm": 0.0}
 
     total_loss = 0.0
+    total_weight = 0.0
     for i in range(0, len(step_episodes), micro_batch_size):
         j = min(i + micro_batch_size, len(step_episodes))
         batch_eps = step_episodes[i:j]
@@ -142,18 +141,23 @@ def sft_step(
             list(p) + list(g) + [pad_token_id] * (max_len - lengths[k])
             for k, (p, g) in enumerate(truncated)
         ]
-        masks = [
-            [0] * len(p) + [1] * len(g) + [0] * (max_len - lengths[k])
-            for k, (p, g) in enumerate(truncated)
-        ]
+        # Weight mask: 1.0 for normal generated tokens, fork_weight for fork targets
+        weight_masks = []
+        for k, (p, g) in enumerate(truncated):
+            prefix_w = [0.0] * len(p)
+            gen_w = []
+            for t in g:
+                gen_w.append(fork_weight if (fork_token_ids and t in fork_token_ids) else 1.0)
+            pad_w = [0.0] * (max_len - lengths[k])
+            weight_masks.append(prefix_w + gen_w + pad_w)
 
         token_ids_t = torch.tensor(token_ids, device=device, dtype=torch.long)
-        masks_t = torch.tensor(masks, device=device, dtype=torch.bool)
+        weight_masks_t = torch.tensor(weight_masks, device=device, dtype=torch.float32)
 
         with torch.autocast(device_type=device.type, dtype=dtype):
             input_ids = token_ids_t[:, :-1]
             target_ids = token_ids_t[:, 1:]
-            target_mask = masks_t[:, 1:]
+            target_weights = weight_masks_t[:, 1:]
             logits = model.forward(input_ids).float()
 
         loss_per_token = torch.nn.functional.cross_entropy(
@@ -163,7 +167,9 @@ def sft_step(
             reduction="none",
         ).reshape(input_ids.shape[0], -1)
 
-        masked_loss = (loss_per_token * target_mask).sum() / total_tokens
+        batch_weight = target_weights.sum()
+        total_weight += batch_weight.item()
+        masked_loss = (loss_per_token * target_weights).sum()
         masked_loss.backward()
         total_loss += masked_loss.item()
 
@@ -172,7 +178,8 @@ def sft_step(
     )
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
-    return {"loss": total_loss, "grad_norm": grad_norm.item()}
+    norm_loss = total_loss / max(total_weight, 1.0)
+    return {"loss": norm_loss, "grad_norm": grad_norm.item()}
 
 
 def check_fork_probability(
@@ -341,12 +348,15 @@ def main(config_path: str):
     # Check fork token presence in episodes
     fork_id = tokenizer.fork_token_id
     fork1_id = tokenizer.fork1_token_id
+    fork2_id = tokenizer.fork2_token_id
+    fork_token_ids_set = {fork_id, fork1_id, fork2_id}
     has_fork = sum(1 for e in fork_episodes
                    if fork_id in e.generated_token_ids or fork1_id in e.generated_token_ids)
     print(f"Episodes with fork token: {has_fork}/{len(fork_episodes)}")
 
-    # SFT training
-    print(f"\n=== SFT Training ({sft_steps} steps) ===")
+    # SFT training with fork-weighted loss
+    fork_weight = float(sft_config.get("fork_weight", 100.0))
+    print(f"\n=== SFT Training ({sft_steps} steps, fork_weight={fork_weight}) ===")
     model.train()
     optimizer = MemoryEfficientAdamW(
         model.parameters(),
@@ -360,7 +370,6 @@ def main(config_path: str):
     tb_writer = SummaryWriter(log_dir=f"{log_dir}/{current_time}")
 
     for step in range(1, sft_steps + 1):
-        # Shuffle episodes each step
         results = sft_step(
             model=model,
             optimizer=optimizer,
@@ -370,6 +379,8 @@ def main(config_path: str):
             max_grad_norm=max_grad_norm,
             device=device,
             dtype=dtype,
+            fork_token_ids=fork_token_ids_set,
+            fork_weight=fork_weight,
         )
 
         tb_writer.add_scalar("sft_loss", results["loss"], step)

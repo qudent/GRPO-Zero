@@ -13,10 +13,11 @@ training:
 sft_warmup:
   vanilla_checkpoint: "ckpt_fork_real/ckpt_000050.pt"
   num_data_batches: 20
-  sft_steps: 80
-  learning_rate: 5.0e-6
+  sft_steps: 100
+  learning_rate: 1.0e-5
   fork_target_prob: 0.25
+  fork_weight: 100.0
   data_answers_per_question: 4
   data_batch_size: 8
-  output_checkpoint: "ckpt_sft_fork/ckpt_sft_fork.pt"
+  output_checkpoint: "ckpt_sft_fork/ckpt_sft_fork_v2.pt"
   log_dir: "logs_sft_fork"
