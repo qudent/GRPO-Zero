@@ -1,5 +1,4 @@
 import dataclasses
-import gc
 import math
 from collections import defaultdict
 from typing import Callable, Dict, List, Optional
@@ -81,8 +80,6 @@ def rollout(
         if is_finished.all():
             break
     model.del_kv_cache()
-    gc.collect()
-    torch.cuda.empty_cache()
     is_finished_list = is_finished.tolist()
     tokens_list = tokens.tolist()
 
@@ -406,8 +403,6 @@ def fork_rollout(
             break
 
     model.del_kv_cache()
-    gc.collect()
-    torch.cuda.empty_cache()
 
     tokens_list = tokens.tolist()
     is_finished_list = is_finished.tolist()
