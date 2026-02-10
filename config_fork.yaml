@@ -38,4 +38,9 @@ fork_race:
   n_warmup: 50              # warmup steps with fork-token probability targeting
   warmup_fork_target_prob: 0.25  # target P(<fork>) for valid rows during warmup
   warmup_fork_fraction: 0.5     # inject fork on 50% of rows per group
+  # Bonus for valid fork presence (decays to zero).
+  warmup_fork_presence_bonus_start: 0.30
+  warmup_fork_presence_bonus_end: 0.00
+  warmup_fork_presence_bonus_steps: 150
+  warmup_fork_presence_bonus_valid_only: true
   entropy_coef: 0.02            # entropy bonus to prevent mode collapse

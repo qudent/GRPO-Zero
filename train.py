@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard.writer import SummaryWriter
 
 from countdown_task import CountdownTasksDataset, reward_function
+from fork_curriculum import apply_fork_presence_bonus, fork_presence_bonus_coef
 from fork_metrics import episode_correct, primary_episodes
 from fork_reward import ForkRewardConfig
 from grpo import fork_rollout, rollout, update_policy, update_policy_fork
@@ -234,6 +235,9 @@ def main(config_path: str, max_steps_override: int | None = None):
         )
         n_warmup = fork_config.get("n_warmup", 50)
         warmup_fork_target_prob = float(fork_config.get("warmup_fork_target_prob", 0.25))
+        warmup_fork_presence_bonus_valid_only = bool(
+            fork_config.get("warmup_fork_presence_bonus_valid_only", True)
+        )
 
     start_time = time.time()
     ckpt_dir = Path(config["training"]["ckpt_dir"])
@@ -265,6 +269,14 @@ def main(config_path: str, max_steps_override: int | None = None):
                 fork_token_target_prob=current_fork_target_prob,
                 warmup_fork_fraction=warmup_fork_fraction,
             )
+
+            # Warmup curriculum: reward valid fork usage early, then decay away.
+            current_fork_presence_bonus = fork_presence_bonus_coef(step, fork_config)
+            episodes, fork_presence_bonus_rate = apply_fork_presence_bonus(
+                episodes=episodes,
+                bonus_coef=current_fork_presence_bonus,
+                valid_only=warmup_fork_presence_bonus_valid_only,
+            )
         else:
             episodes = rollout(
                 model=model,
@@ -276,6 +288,8 @@ def main(config_path: str, max_steps_override: int | None = None):
                 device=device,
                 dtype=dtype,
             )
+            current_fork_presence_bonus = 0.0
+            fork_presence_bonus_rate = 0.0
 
         if config["training"]["skip_unfinished_episodes"]:
             episodes = [episode for episode in episodes if episode.is_finished]
@@ -354,7 +368,13 @@ def main(config_path: str, max_steps_override: int | None = None):
             f"num_finished_episodes: {num_finished_episodes}, "
             f"mean_response_len: {mean_response_len:.2f}, "
             f"entropy: {entropy:.2f}"
-            + (f", fork_rate: {fork_rate:.2f}, T_proxy: {mean_t_proxy:.1f}" if fork_enabled else "")
+            + (
+                f", fork_rate: {fork_rate:.2f}, T_proxy: {mean_t_proxy:.1f}, "
+                f"fork_bonus_coef: {current_fork_presence_bonus:.3f}, "
+                f"fork_bonus_rate: {fork_presence_bonus_rate:.2f}"
+                if fork_enabled
+                else ""
+            )
         )
         if step % config["training"]["eval_interval"] == 0:
             eval_metrics = evaluate(
@@ -399,6 +419,12 @@ def main(config_path: str, max_steps_override: int | None = None):
         if fork_enabled:
             tb_writer.add_scalar("fork_rate", fork_rate, step)
             tb_writer.add_scalar("T_proxy_ms", mean_t_proxy, step)
+            tb_writer.add_scalar(
+                "fork_presence_bonus_coef", current_fork_presence_bonus, step
+            )
+            tb_writer.add_scalar(
+                "fork_presence_bonus_rate", fork_presence_bonus_rate, step
+            )
 
         for i, episode in enumerate(metric_episodes[:text_log_episodes_per_step]):
             # TensorBoard treats text as markdown.
