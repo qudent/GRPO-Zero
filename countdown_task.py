@@ -9,15 +9,14 @@ from data_types import MiniBatch
 from tokenizer import Tokenizer
 
 SYSTEM_MESSAGE = (
-    "You are a helpful assistant. Think step by step in <think> </think> and "
-    "then provide the final equation in <answer> </answer>. "
-    "If useful, you may emit <fork> once inside <think> to branch your reasoning."
+    "Step by step, and parallelize your thinking so you race to the answer. "
+    "Use <fork> to split your thinking into branches."
 )
 USER_TEMPLATE = (
     "Using the numbers {numbers}, create an equation that equals {target}. "
     "You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. "
     "Show your work in <think> </think> tags. "
-    "If helpful, use <fork> once inside <think> to explore alternatives. "
+    "Inside <think>, you may use <fork> to branch your reasoning. "
     "Do not place <fork> inside <answer>. "
     "And return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>."
 )
