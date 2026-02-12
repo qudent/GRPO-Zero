@@ -48,12 +48,11 @@ Fix:
   - failure: `R = -delta - beta * invalid_fork`
   - `L_norm in [0, 1]`
 
-### Risk D: Incorrect gradient attribution (double counting)
+### Risk D: Gradient attribution
 Fix:
-- Token-weighted objective:
-  - pre-fork tokens: weight `1.0`
-  - post-fork branch tokens at step `s`: weight `1 / active_branches(s)`
-- Normalize by sum of token weights, not raw token count.
+- Uniform token weights (1.0 for all tokens, including post-fork).
+- Post-fork tokens need full gradient to learn branch-specific behavior (diversification).
+- Prior approach (weight 1/active_branches) starved the model of signal on exactly the tokens that matter most.
 
 ### Risk E: Parser ambiguity for “inside think” and answer completion
 Fix:
@@ -73,7 +72,7 @@ Direct per-rollout reward uses a **hardware-calibrated latency proxy** to reduce
 
 - Calibrate once per machine:
   - `c1_ms` = average ms/step with 1 active branch
-  - `c2_ms` = average ms/step with 2 active branches
+  - `c2_ms` = average ms/step with 2 active branches (≈ c1 for small models on large GPUs; use ~1.05)
 - During rollout, accumulate:
   - `T_proxy_ms = sum_s c_{b_s}` where `b_s in {1,2}` active branches at step `s`.
 - If correct answer appears at step `s*`, latency term uses prefix sum up to `s*`.
@@ -152,8 +151,8 @@ If criterion fails, treat v0 as negative/neutral signal and do not escalate comp
 - produce rollout-level scalar reward for GRPO
 
 4. GRPO update weighting:
-- token weights by active branch count
-- shared-prefix counted once
+- uniform token weights (1.0 for all tokens)
+- group-level reward: both branches get same reward based on either-branch-correct
 
 5. Evaluation harness:
 - method selector (`single-path`, `external-race-2`, `internal-fork-race-2`)

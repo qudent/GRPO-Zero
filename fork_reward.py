@@ -16,7 +16,7 @@ class ForkRewardConfig:
     delta: float = 0.2       # failure base penalty
     budget_ms: float = 2500.0  # wall-clock budget for normalization
     c1_ms: float = 1.0       # ms per step with 1 active branch (calibrated)
-    c2_ms: float = 1.5       # ms per step with 2 active branches (calibrated)
+    c2_ms: float = 1.05      # ms per step with 2 active branches (nearly free on underutilized GPU)
 
 
 def compute_latency_proxy(
@@ -93,34 +93,13 @@ def compute_fork_reward(
 
 def compute_token_weights(
     total_tokens: int,
-    fork_position: Optional[int],
-    branch_id: Optional[int],
+    fork_position: Optional[int] = None,
+    branch_id: Optional[int] = None,
     active_branches: int = 1,
 ) -> List[float]:
     """Compute per-token weights for GRPO objective.
 
-    Per EXPERIMENT_PLAN.md section 4 (Risk D):
-    - pre-fork tokens: weight 1.0
-    - post-fork tokens: weight 1/active_branches
-
-    Args:
-        total_tokens: total generated tokens in this episode
-        fork_position: token index where fork occurred (None if no fork)
-        branch_id: which branch this episode is (0=A, 1=B, None=no fork)
-        active_branches: number of active branches after fork
-
-    Returns:
-        List of per-token weights
+    All tokens get uniform weight 1.0 — the model needs full gradient on
+    post-fork tokens to learn branch-specific behavior (diversification).
     """
-    if fork_position is None or branch_id is None:
-        # No fork: all tokens weight 1.0
-        return [1.0] * total_tokens
-
-    weights = []
-    post_fork_weight = 1.0 / active_branches
-    for i in range(total_tokens):
-        if i < fork_position:
-            weights.append(1.0)
-        else:
-            weights.append(post_fork_weight)
-    return weights
+    return [1.0] * total_tokens

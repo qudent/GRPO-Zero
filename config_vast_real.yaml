@@ -37,7 +37,7 @@ fork_race:
   delta: 0.2
   budget_ms: 2500.0
   c1_ms: 1.0
-  c2_ms: 1.5
+  c2_ms: 1.05
   n_warmup: 50
   warmup_fork_target_prob: 0.25
   warmup_fork_fraction: 0.5       # inject fork on 50% of rows per group
